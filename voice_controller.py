@@ -545,8 +545,6 @@ async def main() -> None:
         for name, ids in speakers.items()
     ]
     enrolled_labels = set(speakers.keys())
-    print(f"[READY] Enrolled speakers: {', '.join(enrolled_labels)}")
-
     transcription_config = _build_transcription_config(speakers=speaker_identifiers)
     dot = StatusDot()
     controller = VoiceController(enrolled_labels=enrolled_labels, dot=dot)
@@ -560,6 +558,10 @@ async def main() -> None:
         print("PyAudio not available - install with `pip install pyaudio`.")
         return
 
+    print("Voice app started.")
+    if _DEBUG:
+        print("[READY] Debug mode ON.")
+
     try:
         async with AsyncClient(api_key=api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
 
@@ -567,7 +569,6 @@ async def main() -> None:
             def _on_started(message: dict[str, Any]) -> None:
                 if _DEBUG:
                     print("[DBG MSG] RECOGNITION_STARTED")
-                print("[READY] Connected. Say 'Alright Claude' to begin.")
                 dot.start("idle")
 
             @client.on(ServerMessageType.ADD_TRANSCRIPT)
@@ -587,9 +588,6 @@ async def main() -> None:
                 print(f"[ERROR] Server error: {reason}")
                 stop_event.set()
 
-            if _DEBUG:
-                print("[READY] Debug mode ON.")
-            print("[READY] Connecting... (press Ctrl+C to exit)")
             await client.start_session(
                 transcription_config=transcription_config,
                 audio_format=audio_format,
