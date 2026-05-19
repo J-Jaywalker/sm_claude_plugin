@@ -18,7 +18,6 @@ import asyncio
 import os
 import re
 import signal
-import sys
 from enum import Enum
 from typing import Any
 
@@ -116,12 +115,13 @@ class VoiceController:
         prompt = " ".join(self.buffer).strip()
         self.buffer.clear()
         self._idle_buffer = ""
-        self.state = _State.IDLE
 
         if not prompt:
-            self.state = _State.IDLE
+            # Wake word heard but no command in this utterance yet —
+            # stay ACCUMULATING and wait for the user to continue.
             return
 
+        self.state = _State.IDLE
         self.last_prompt = prompt
         print(f"\n[SENDING] {prompt}")
         self.prompt_ready.set()
@@ -179,6 +179,58 @@ async def _audio_pump(
                 print(f"[ERROR] send_audio failed: {exc}")
                 stop_event.set()
                 return
+
+
+async def claude_driver(
+    controller: VoiceController,
+    stop_event: asyncio.Event,
+) -> None:
+    """Run claude -p for each assembled prompt and stream the response.
+
+    Uses claude's non-interactive print mode to avoid fighting the TUI.
+    ASR is paused while Claude is running and resumed when it exits.
+
+    Args:
+        controller: Shared voice controller carrying prompts and the
+            listening gate.
+        stop_event: Cooperative shutdown event.
+    """
+    child_env = {k: v for k, v in os.environ.items() if k != "DEBUG"}
+
+    while not stop_event.is_set():
+        await controller.prompt_ready.wait()
+        controller.prompt_ready.clear()
+        prompt_text = controller.last_prompt
+        if not prompt_text:
+            continue
+
+        controller.listening.clear()
+        print(f"\n[CLAUDE] {prompt_text}\n")
+
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--continue", "-p", prompt_text,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=child_env,
+            )
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(256)
+                if not chunk:
+                    break
+                print(chunk.decode(errors="replace"), end="", flush=True)
+            await proc.wait()
+        except asyncio.CancelledError:
+            if proc is not None:
+                proc.terminate()
+            raise
+        except Exception as exc:
+            print(f"[CLAUDE] Error: {exc}")
+
+        print("\n")
+        controller.listening.set()
 
 
 async def main() -> None:
@@ -245,11 +297,18 @@ async def main() -> None:
                 ),
                 name="audio-pump",
             )
+            driver_task = asyncio.create_task(
+                claude_driver(
+                    controller=controller,
+                    stop_event=stop_event,
+                ),
+                name="claude-driver",
+            )
             stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
 
             try:
                 await asyncio.wait(
-                    {pump_task, stop_task},
+                    {pump_task, driver_task, stop_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             except asyncio.CancelledError:
@@ -257,8 +316,9 @@ async def main() -> None:
             finally:
                 stop_event.set()
                 pump_task.cancel()
+                driver_task.cancel()
                 stop_task.cancel()
-                for task in (pump_task, stop_task):
+                for task in (pump_task, driver_task, stop_task):
                     try:
                         await task
                     except (asyncio.CancelledError, Exception):
