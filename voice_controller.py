@@ -51,7 +51,7 @@ _WAKE_WORD_PATTERN = re.compile(r"\bcrab[\s\-]+bot\b")
 _DEBUG = bool(os.environ.get("DEBUG"))
 _IDLE_BUFFER_MAX = 120
 
-_SPEAKERS_FILE = "speakers.txt"
+_SPEAKERS_FILE = os.path.join(os.path.dirname(__file__), "speakers.txt")
 _ENROLLMENT_SECONDS = 30
 
 _RT_URL = "ws://127.0.0.1:9002/v2" if os.environ.get("SM_LOCAL_CLAUDE_TRANSCRIPTION") else None
@@ -130,7 +130,7 @@ class UI:
         )
         layout["top"].split_row(
             Layout(name="visualiser", size=26),
-            Layout(name="title"),
+            Layout(name="instructions"),
         )
         return layout
 
@@ -157,8 +157,15 @@ class UI:
             border_style=color,
         )
 
-    def _title_panel(self) -> Panel:
-        return Panel(Align.center(Text("C.R.A.B — Claude Realtime Audio Bot", style="bold")))
+    def _instructions_panel(self) -> Panel:
+        t = Text(justify="left")
+        t.append("How to use\n\n", style="bold")
+        t.append("1. ", style="dim"); t.append('Say "CRAB-BOT"\n')
+        t.append("2. ", style="dim"); t.append("Speak your command naturally\n")
+        t.append("3. ", style="dim"); t.append("Pause — end of speech is detected automatically\n")
+        t.append("4. ", style="dim"); t.append("Wait for Claude to respond\n")
+        t.append("5. ", style="dim"); t.append('Say "CRAB-BOT" again for your next command')
+        return Panel(Align.center(t, vertical="middle"), title="[bold]C.R.A.B — Claude Realtime Audio Bot[/bold]", border_style="dim")
 
     def _body_panel(self) -> Panel:
         content: Any = (
@@ -179,7 +186,7 @@ class UI:
 
     def _refresh(self) -> None:
         self._layout["visualiser"].update(self._visualiser_panel())
-        self._layout["title"].update(self._title_panel())
+        self._layout["instructions"].update(self._instructions_panel())
         self._layout["body"].update(self._body_panel())
         self._layout["footer"].update(self._footer_panel())
         if self._live:
@@ -580,7 +587,9 @@ async def claude_driver(
     frames, then restores it when done.
     """
     child_env = {k: v for k, v in os.environ.items() if k != "DEBUG"}
-    system_prompt = _load_system_prompt()
+    cwd = os.getcwd()
+    base_prompt = _load_system_prompt()
+    system_prompt = f"{base_prompt}\n\nWorking directory: {cwd}".strip()
     first_prompt = True
 
     while not stop_event.is_set():
@@ -667,6 +676,10 @@ async def main() -> None:
     controller = VoiceController(enrolled_labels=enrolled_labels, ui=ui)
     stop_event = asyncio.Event()
 
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+
     mic = Microphone(
         sample_rate=audio_format.sample_rate,
         chunk_size=audio_format.chunk_size,
@@ -748,6 +761,10 @@ async def main() -> None:
                             await task
                         except (asyncio.CancelledError, Exception):
                             pass
+                    try:
+                        await asyncio.wait_for(client.stop_session(), timeout=3.0)
+                    except Exception:
+                        pass
 
         except AuthenticationError as exc:
             ui.add_error_message(f"[ERROR] Authentication failed: {exc}")
@@ -757,11 +774,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    def _handle_sigint(sig: int, frame: object) -> None:
-        signal.signal(signal.SIGINT, lambda *_: os._exit(1))
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
