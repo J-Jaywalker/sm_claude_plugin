@@ -22,11 +22,11 @@ from collections import deque
 from enum import Enum
 from typing import Any
 
+from rich import box as rich_box
 from rich.align import Align
 from rich.console import Group
 from rich.layout import Layout
 from rich.live import Live
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
@@ -109,11 +109,12 @@ _CRAB_ART = _load_crab_art()
 class UI:
     """Full-screen terminal UI: status bar, conversation history, prompt strip."""
 
-    def __init__(self) -> None:
+    def __init__(self, speaker_name: str = "You") -> None:
+        self._speaker_name = speaker_name
         self._status = "idle"
         self._last_prompt = ""
         self._partial = ""
-        self._history: deque[Any] = deque(maxlen=30)
+        self._history: deque[dict[str, Any]] = deque(maxlen=30)
         self._frame = 0
         self._live: Live | None = None
         self._pulse_task: asyncio.Task[None] | None = None
@@ -168,19 +169,47 @@ class UI:
         return Panel(Align.center(t, vertical="middle"), title="[bold]C.R.A.B — Claude Realtime Audio Bot[/bold]", border_style="dim")
 
     def _body_panel(self) -> Panel:
-        content: Any = (
-            Group(*list(self._history))
-            if self._history
-            else Align.center(Text("No conversation yet.", style="dim"))
-        )
+        if not self._history:
+            content: Any = Align.center(Text("No conversation yet.", style="dim"))
+        else:
+            items: list[Any] = []
+            for msg in self._history:
+                role = msg["role"]
+                if role == "user":
+                    items.append(Panel(
+                        Text(msg["text"]),
+                        title=f"[bold cyan]{self._speaker_name}[/bold cyan]",
+                        box=rich_box.ROUNDED,
+                        border_style="cyan",
+                        expand=False,
+                    ))
+                elif role == "assistant":
+                    t = Text()
+                    for i, (kind, seg) in enumerate(msg["segments"]):
+                        if i > 0:
+                            t.append("\n")
+                        t.append(seg, style="dim" if kind == "tool" else "")
+                    items.append(Align.right(Panel(
+                        t,
+                        title="[dim]CRAB[/dim]",
+                        box=rich_box.ROUNDED,
+                        border_style="dim",
+                        expand=False,
+                    )))
+                elif role == "done":
+                    items.append(Align.right(Text(msg["text"], style="dim")))
+                elif role == "error":
+                    items.append(Text(msg["text"], style="bright_red"))
+                items.append(Text(""))
+            content = Group(*items)
         return Panel(content, title="[dim]Conversation[/dim]", border_style="dim")
 
     def _footer_panel(self) -> Panel:
         display = self._partial or self._last_prompt
         t = Text()
-        t.append("> ", style="dim")
+        t.append(f"{self._speaker_name}  ", style="bold cyan")
         t.append(display)
-        return Panel(t, border_style="dim")
+        return Panel(t, box=rich_box.ROUNDED, border_style="cyan")
 
     # -- Refresh -------------------------------------------------------------
 
@@ -227,23 +256,30 @@ class UI:
     def add_user_message(self, text: str) -> None:
         self._last_prompt = text
         self._partial = ""
-        t = Text()
-        t.append("You: ", style="bold cyan")
-        t.append(text)
-        self._history.append(t)
+        self._history.append({"role": "user", "text": text})
         self._refresh()
 
     def add_assistant_text(self, text: str) -> None:
-        clean = _ANSI_ESCAPE.sub("", text)
-        self._history.append(Markdown(clean, code_theme="ansi_dark"))
+        clean = _ANSI_ESCAPE.sub("", text).strip()
+        if not clean:
+            return
+        if self._history and self._history[-1]["role"] == "assistant":
+            self._history[-1]["segments"].append(("text", clean))
+        else:
+            self._history.append({"role": "assistant", "segments": [("text", clean)]})
         self._refresh()
 
     def add_tool_use(self, label: str) -> None:
-        self._history.append(Text(label, style="dim"))
+        if label.startswith("[DONE]"):
+            self._history.append({"role": "done", "text": label})
+        elif self._history and self._history[-1]["role"] == "assistant":
+            self._history[-1]["segments"].append(("tool", label))
+        else:
+            self._history.append({"role": "assistant", "segments": [("tool", label)]})
         self._refresh()
 
     def add_error_message(self, text: str) -> None:
-        self._history.append(Text(text, style="bright_red"))
+        self._history.append({"role": "error", "text": text})
         self._refresh()
 
 
@@ -558,7 +594,9 @@ async def _enroll_speaker(api_key: str, audio_format: AudioFormat) -> dict[str, 
 
 def _handle_stream_event(event: dict[str, Any], ui: UI) -> None:
     """Dispatch a claude --output-format stream-json event to the UI."""
-    if event.get("type") == "assistant":
+    event_type = event.get("type")
+
+    if event_type == "assistant":
         for block in event.get("message", {}).get("content", []):
             if block.get("type") == "text":
                 ui.add_assistant_text(block["text"])
@@ -566,14 +604,40 @@ def _handle_stream_event(event: dict[str, Any], ui: UI) -> None:
                 name = block.get("name", "")
                 inp = block.get("input", {})
                 if name in ("Edit", "Write"):
-                    path = inp.get("file_path", "?")
-                    ui.add_tool_use(f"[EDIT] {os.path.relpath(path)}")
+                    ui.add_tool_use(f"[EDIT] {os.path.relpath(inp.get('file_path', '?'))}")
                 elif name == "Bash":
-                    ui.add_tool_use(f"[BASH] {inp.get('command', '?')[:100]}")
+                    ui.add_tool_use(f"[BASH] {inp.get('command', '?')[:120]}")
                 elif name:
                     ui.add_tool_use(f"[TOOL] {name}")
-    elif event.get("type") == "result" and event.get("subtype") == "error":
-        ui.add_error_message(f"[CLAUDE ERROR] {event.get('error', '')}")
+
+    elif event_type == "user":
+        for block in event.get("message", {}).get("content", []):
+            if block.get("type") != "tool_result":
+                continue
+            content = block.get("content", "")
+            if isinstance(content, list):
+                output = "\n".join(c.get("text", "") for c in content if c.get("type") == "text")
+            else:
+                output = str(content)
+            output = output.strip()
+            if output:
+                truncated = output[:200] + ("…" if len(output) > 200 else "")
+                ui.add_tool_use(f"  └─ {truncated}")
+
+    elif event_type == "result":
+        if event.get("subtype") == "error":
+            ui.add_error_message(f"[CLAUDE ERROR] {event.get('error', '')}")
+        elif event.get("subtype") == "success":
+            usage = event.get("usage", {})
+            in_tok = usage.get("input_tokens", 0)
+            out_tok = usage.get("output_tokens", 0)
+            cache_read = usage.get("cache_read_input_tokens", 0)
+            duration_s = (event.get("duration_ms") or 0) / 1000
+            parts = [f"{in_tok:,} in", f"{out_tok:,} out"]
+            if cache_read:
+                parts.append(f"{cache_read:,} cached")
+            parts.append(f"Completed in {duration_s:.1f}s")
+            ui.add_tool_use("[DONE] " + " · ".join(parts))
 
 
 async def claude_driver(
@@ -672,7 +736,8 @@ async def main() -> None:
     enrolled_labels = set(speakers.keys())
     transcription_config = _build_transcription_config(speakers=speaker_identifiers)
 
-    ui = UI()
+    speaker_name = next(iter(enrolled_labels), "You")
+    ui = UI(speaker_name=speaker_name)
     controller = VoiceController(enrolled_labels=enrolled_labels, ui=ui)
     stop_event = asyncio.Event()
 
