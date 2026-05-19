@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Speaker enrollment data — contains voice identifiers, personal to each user
+speakers.txt
