@@ -3,7 +3,7 @@
 Streams microphone audio to Speechmatics RT ASR. On first run, enrolls the
 speaker by capturing 30 seconds of audio and saving identifiers to speakers.txt.
 On subsequent runs, loads enrolled speakers and ignores transcripts from
-unrecognised voices. Detects wake phrase "Alright Claude" in finals, accumulates
+unrecognised voices. Detects wake phrase "CRAB-BOT" in finals, accumulates
 until EndOfUtterance, then submits the prompt to Claude Code via `claude -p`.
 
 Usage:
@@ -18,16 +18,17 @@ import json
 import os
 import re
 import signal
-import sys
+from collections import deque
 from enum import Enum
 from typing import Any
 
-_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-
-from rich.console import Console
+from rich.align import Align
+from rich.console import Group
+from rich.layout import Layout
+from rich.live import Live
 from rich.markdown import Markdown
-
-_console = Console()
+from rich.panel import Panel
+from rich.text import Text
 
 from speechmatics.rt import (
     AsyncClient,
@@ -45,7 +46,8 @@ from speechmatics.rt import (
 )
 
 
-_WAKE_WORD_PATTERN = re.compile(r"\ball\s*right\s+claude\b|\balright\s+claude\b")
+_ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_WAKE_WORD_PATTERN = re.compile(r"\bcrab[\s\-]+bot\b")
 _DEBUG = bool(os.environ.get("DEBUG"))
 _IDLE_BUFFER_MAX = 120
 
@@ -54,66 +56,188 @@ _ENROLLMENT_SECONDS = 30
 
 _RT_URL = "ws://127.0.0.1:9002/v2" if os.environ.get("SM_LOCAL_CLAUDE_TRANSCRIPTION") else None
 
+_SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
 
-# ---------------------------------------------------------------------------
-# Status dot
-# ---------------------------------------------------------------------------
+def _load_system_prompt() -> str:
+    try:
+        with open(_SYSTEM_PROMPT_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
 
-_DOT_FRAMES = ("●", "◉", "◎", "◉")
 _DOT_INTERVAL = 0.2
 
-_DOT_STATES: dict[str, tuple[str, str]] = {
-    #              ANSI colour   label
-    "idle":      ("\033[91m", "Waiting for wake word..."),   # bright red
-    "listening": ("\033[92m", "Claude is listening..."),     # bright green
-    "thinking":  ("\033[93m", "Claude is thinking..."),      # bright yellow
-}
-_RESET = "\033[0m"
+_CRAB_ART_FILE = os.path.join(os.path.dirname(__file__), "crab_art.txt")
 
 
-class StatusDot:
-    """Animated single-line status indicator.
+def _load_crab_art() -> dict[str, Any]:
+    sections: dict[str, str] = {}
+    current: str | None = None
+    lines: list[str] = []
+    try:
+        with open(_CRAB_ART_FILE, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if line.startswith("[") and line.endswith("]"):
+                    if current is not None:
+                        sections[current] = "\n".join(lines).strip("\n")
+                    current = line[1:-1]
+                    lines = []
+                elif current is not None:
+                    lines.append(line)
+        if current is not None:
+            sections[current] = "\n".join(lines).strip("\n")
+    except FileNotFoundError:
+        pass
+    return {
+        "idle":      sections.get("idle",       "彡(-.-)ミ\n  ^   ^"),
+        "listening": sections.get("listening",  "彡(ᵔᵕᵔ)ミ\n  ^   ^"),
+        "thinking":  [
+            sections.get("thinking_0", "彡('o')ミ"),
+            sections.get("thinking_1", "彡('o')ミ"),
+        ],
+    }
 
-    Pulses a coloured dot on the current terminal line using \\r so it is
-    overwritten cleanly when transcript text or Claude output arrives.
-    Colour and label change with the voice-controller state.
-    """
+
+_CRAB_ART = _load_crab_art()
+
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+class UI:
+    """Full-screen terminal UI: status bar, conversation history, prompt strip."""
 
     def __init__(self) -> None:
-        self._task: asyncio.Task[None] | None = None
-        self._state = "idle"
+        self._status = "idle"
+        self._last_prompt = ""
+        self._partial = ""
+        self._history: deque[Any] = deque(maxlen=30)
         self._frame = 0
+        self._live: Live | None = None
+        self._pulse_task: asyncio.Task[None] | None = None
+        self._layout = self._make_layout()
 
-    async def _run(self) -> None:
+    # -- Layout --------------------------------------------------------------
+
+    def _make_layout(self) -> Layout:
+        layout = Layout()
+        layout.split_column(
+            Layout(name="top", size=12),
+            Layout(name="body"),
+            Layout(name="footer", size=3),
+        )
+        layout["top"].split_row(
+            Layout(name="visualiser", size=26),
+            Layout(name="title"),
+        )
+        return layout
+
+    # -- Renderers -----------------------------------------------------------
+
+    def _visualiser_panel(self) -> Panel:
+        if self._status == "idle":
+            art = _CRAB_ART["idle"]
+            label = "Idle"
+            color = "bright_red"
+        elif self._status == "listening":
+            art = _CRAB_ART["listening"]
+            label = "Listening..."
+            color = "bright_green"
+        else:
+            art = _CRAB_ART["thinking"][(self._frame // 5) % 2]
+            label = "Thinking..."
+            color = "bright_yellow"
+        t = Text(art, style=color, justify="center")
+        return Panel(
+            Align.center(t, vertical="middle"),
+            title="[bold]CRAB VISUALISER[/bold]",
+            subtitle=f"[{color}]{label}[/{color}]",
+            border_style=color,
+        )
+
+    def _title_panel(self) -> Panel:
+        return Panel(Align.center(Text("C.R.A.B — Claude Realtime Audio Bot", style="bold")))
+
+    def _body_panel(self) -> Panel:
+        content: Any = (
+            Group(*list(self._history))
+            if self._history
+            else Align.center(Text("No conversation yet.", style="dim"))
+        )
+        return Panel(content, title="[dim]Conversation[/dim]", border_style="dim")
+
+    def _footer_panel(self) -> Panel:
+        display = self._partial or self._last_prompt
+        t = Text()
+        t.append("> ", style="dim")
+        t.append(display)
+        return Panel(t, border_style="dim")
+
+    # -- Refresh -------------------------------------------------------------
+
+    def _refresh(self) -> None:
+        self._layout["visualiser"].update(self._visualiser_panel())
+        self._layout["title"].update(self._title_panel())
+        self._layout["body"].update(self._body_panel())
+        self._layout["footer"].update(self._footer_panel())
+        if self._live:
+            self._live.refresh()
+
+    async def _pulse(self) -> None:
         while True:
-            color, label = _DOT_STATES[self._state]
-            dot = _DOT_FRAMES[self._frame % len(_DOT_FRAMES)]
-            sys.stdout.write(f"\r{color}{dot} {label}{_RESET}  ")
-            sys.stdout.flush()
             self._frame += 1
+            self._refresh()
             await asyncio.sleep(_DOT_INTERVAL)
 
-    def clear(self) -> None:
-        """Erase the status line so other output can print cleanly."""
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
+    # -- Lifecycle -----------------------------------------------------------
 
-    def start(self, state: str) -> None:
-        """Start (or switch to) a new state, restarting the animation."""
-        self.stop()
-        self._state = state
-        self._frame = 0
+    def start(self, live: Live) -> None:
+        self._live = live
         try:
-            self._task = asyncio.create_task(self._run(), name="status-dot")
+            self._pulse_task = asyncio.create_task(self._pulse(), name="ui-pulse")
         except RuntimeError:
-            pass  # event loop not running (e.g. during shutdown)
+            pass
 
     def stop(self) -> None:
-        """Cancel the animation and erase the status line."""
-        if self._task and not self._task.done():
-            self._task.cancel()
-        self._task = None
-        self.clear()
+        if self._pulse_task and not self._pulse_task.done():
+            self._pulse_task.cancel()
+        self._pulse_task = None
+
+    # -- State mutations -----------------------------------------------------
+
+    def set_status(self, status: str) -> None:
+        self._status = status
+        if status != "listening":
+            self._partial = ""
+        self._refresh()
+
+    def set_partial(self, text: str) -> None:
+        self._partial = text
+        self._refresh()
+
+    def add_user_message(self, text: str) -> None:
+        self._last_prompt = text
+        self._partial = ""
+        t = Text()
+        t.append("You: ", style="bold cyan")
+        t.append(text)
+        self._history.append(t)
+        self._refresh()
+
+    def add_assistant_text(self, text: str) -> None:
+        clean = _ANSI_ESCAPE.sub("", text)
+        self._history.append(Markdown(clean, code_theme="ansi_dark"))
+        self._refresh()
+
+    def add_tool_use(self, label: str) -> None:
+        self._history.append(Text(label, style="dim"))
+        self._refresh()
+
+    def add_error_message(self, text: str) -> None:
+        self._history.append(Text(text, style="bright_red"))
+        self._refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +304,8 @@ class _State(str, Enum):
 class VoiceController:
     """Coordinates microphone capture, ASR events, and prompt assembly."""
 
-    def __init__(self, enrolled_labels: set[str], dot: StatusDot) -> None:
-        self._dot = dot
+    def __init__(self, enrolled_labels: set[str], ui: UI) -> None:
+        self._ui = ui
         self.enrolled_labels = enrolled_labels
         self.state: _State = _State.IDLE
         self.buffer: list[str] = []
@@ -199,23 +323,19 @@ class VoiceController:
 
         if self.enrolled_labels:
             speaker = _dominant_speaker(message.get("results", []))
-            # Only filter when the server returned a label — if None the
-            # endpoint doesn't support diarization; let the transcript through.
             if speaker is not None and speaker not in self.enrolled_labels:
                 if _DEBUG:
-                    print(f"[DBG] ignored transcript from speaker {speaker!r}")
+                    self._ui.add_tool_use(f"[DBG] ignored transcript from {speaker!r}")
                 return
 
         if self.state is _State.IDLE:
             if _DEBUG:
-                self._dot.clear()
-                print(f"[DBG] {transcript!r}")
-                self._dot.start("idle")
+                self._ui.add_tool_use(f"[DBG] {transcript!r}")
             self._idle_buffer = (self._idle_buffer + " " + transcript)[-_IDLE_BUFFER_MAX:]
             if _WAKE_WORD_PATTERN.search(_normalize(self._idle_buffer)):
                 self._idle_buffer = ""
                 self.state = _State.ACCUMULATING
-                self._dot.start("listening")
+                self._ui.set_status("listening")
             return
 
         # ACCUMULATING: strip wake word tail if present in the first final.
@@ -225,17 +345,14 @@ class VoiceController:
 
         transcript = transcript.strip()
         if transcript and re.search(r"[a-zA-Z]", transcript):
-            if not self.buffer:
-                # First real word — clear the listening dot so transcript owns the line.
-                self._dot.stop()
             self.buffer.append(transcript)
-            print(f"\r  {' '.join(self.buffer)}", end="", flush=True)
+            self._ui.set_partial(" ".join(self.buffer))
 
     def handle_end_of_utterance(self, message: dict[str, Any]) -> None:
         """Handle an END_OF_UTTERANCE server message."""
         del message
         if _DEBUG:
-            print("[DBG MSG] END_OF_UTTERANCE")
+            self._ui.add_tool_use("[DBG MSG] END_OF_UTTERANCE")
 
         if self.state is _State.IDLE:
             self._idle_buffer = ""
@@ -252,13 +369,13 @@ class VoiceController:
         if not re.search(r"[a-zA-Z]{2,}", prompt):
             # Only punctuation/noise — reset silently so user can try again.
             self.state = _State.IDLE
-            self._dot.start("idle")
+            self._ui.set_status("idle")
             return
 
         self.state = _State.IDLE
         self.last_prompt = prompt
-        print(f"\n[SENDING] {prompt}", flush=True)
-        self._dot.start("thinking")
+        self._ui.add_user_message(prompt)
+        self._ui.set_status("thinking")
         self.prompt_ready.set()
 
 
@@ -290,7 +407,7 @@ def _build_transcription_config(
         ),
         speaker_diarization_config=diarization_config,
         additional_vocab=[
-            {"content": "Claude", "sounds_like": ["clawed", "cloud"]},
+            {"content": "CRAB-BOT", "sounds_like": ["crab bot", "grab bot", "crab bought"]},
         ],
     )
 
@@ -312,8 +429,7 @@ async def _audio_pump(
             frame = await mic.read(chunk_size=chunk_size)
         except asyncio.CancelledError:
             raise
-        except RuntimeError as exc:
-            print(f"[ERROR] Microphone read failed: {exc}")
+        except RuntimeError:
             stop_event.set()
             return
 
@@ -322,8 +438,7 @@ async def _audio_pump(
                 await client.send_audio(frame)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                print(f"[ERROR] send_audio failed: {exc}")
+            except Exception:  # noqa: BLE001
                 stop_event.set()
                 return
 
@@ -366,7 +481,7 @@ async def _enroll_speaker(api_key: str, audio_format: AudioFormat) -> dict[str, 
         diarization="speaker",
         max_delay=1.0,
         additional_vocab=[
-            {"content": "Claude", "sounds_like": ["clawed", "cloud"]},
+            {"content": "CRAB-BOT", "sounds_like": ["crab bot", "grab bot", "crab bought"]},
         ],
     )
 
@@ -434,38 +549,38 @@ async def _enroll_speaker(api_key: str, audio_format: AudioFormat) -> dict[str, 
 # Claude output rendering + driver
 # ---------------------------------------------------------------------------
 
-def _print_stream_event(event: dict[str, Any]) -> None:
-    """Print human-readable output from a claude --output-format stream-json event."""
+def _handle_stream_event(event: dict[str, Any], ui: UI) -> None:
+    """Dispatch a claude --output-format stream-json event to the UI."""
     if event.get("type") == "assistant":
         for block in event.get("message", {}).get("content", []):
             if block.get("type") == "text":
-                text = _ANSI_ESCAPE.sub("", block["text"])
-                _console.print(Markdown(text, code_theme="ansi_dark"))
+                ui.add_assistant_text(block["text"])
             elif block.get("type") == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
                 if name in ("Edit", "Write"):
                     path = inp.get("file_path", "?")
-                    print(f"[EDIT] {os.path.relpath(path)}", flush=True)
+                    ui.add_tool_use(f"[EDIT] {os.path.relpath(path)}")
                 elif name == "Bash":
-                    print(f"[BASH] {inp.get('command', '?')[:100]}", flush=True)
+                    ui.add_tool_use(f"[BASH] {inp.get('command', '?')[:100]}")
                 elif name:
-                    print(f"[TOOL] {name}", flush=True)
+                    ui.add_tool_use(f"[TOOL] {name}")
     elif event.get("type") == "result" and event.get("subtype") == "error":
-        print(f"[CLAUDE ERROR] {event.get('error', '')}", flush=True)
+        ui.add_error_message(f"[CLAUDE ERROR] {event.get('error', '')}")
 
 
 async def claude_driver(
     controller: VoiceController,
-    dot: StatusDot,
+    ui: UI,
     stop_event: asyncio.Event,
 ) -> None:
-    """Run `claude -p` for each assembled prompt, streaming output.
+    """Run `claude -p` for each assembled prompt, streaming output to the UI.
 
     Clears controller.listening while Claude runs so the audio pump drops
     frames, then restores it when done.
     """
     child_env = {k: v for k, v in os.environ.items() if k != "DEBUG"}
+    system_prompt = _load_system_prompt()
     first_prompt = True
 
     while not stop_event.is_set():
@@ -476,8 +591,6 @@ async def claude_driver(
             continue
 
         controller.listening.clear()
-        dot.stop()
-        print(f"[CLAUDE] {prompt_text}\n")
 
         cmd = [
             "claude",
@@ -485,6 +598,8 @@ async def claude_driver(
             "--verbose",
             "--output-format", "stream-json",
         ]
+        if system_prompt:
+            cmd += ["--system-prompt", system_prompt]
         if not first_prompt:
             cmd.append("--continue")
         cmd += ["-p", prompt_text]
@@ -507,19 +622,20 @@ async def claude_driver(
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
-                    print(_ANSI_ESCAPE.sub("", line), flush=True)
+                    clean = _ANSI_ESCAPE.sub("", line)
+                    if clean:
+                        ui.add_tool_use(clean)
                     continue
-                _print_stream_event(event)
+                _handle_stream_event(event, ui)
             await proc.wait()
         except asyncio.CancelledError:
             if proc is not None:
                 proc.terminate()
             raise
         except Exception as exc:
-            print(f"[CLAUDE] Error: {exc}")
+            ui.add_error_message(f"[CLAUDE] Error: {exc}")
 
-        print()
-        dot.start("idle")
+        ui.set_status("idle")
         controller.listening.set()
 
 
@@ -546,8 +662,9 @@ async def main() -> None:
     ]
     enrolled_labels = set(speakers.keys())
     transcription_config = _build_transcription_config(speakers=speaker_identifiers)
-    dot = StatusDot()
-    controller = VoiceController(enrolled_labels=enrolled_labels, dot=dot)
+
+    ui = UI()
+    controller = VoiceController(enrolled_labels=enrolled_labels, ui=ui)
     stop_event = asyncio.Event()
 
     mic = Microphone(
@@ -558,84 +675,85 @@ async def main() -> None:
         print("PyAudio not available - install with `pip install pyaudio`.")
         return
 
-    print("Voice app started.")
-    if _DEBUG:
-        print("[READY] Debug mode ON.")
+    with Live(ui._layout, screen=True, auto_refresh=False) as live:
+        ui.start(live)
+        if _DEBUG:
+            ui.add_tool_use("[READY] Debug mode ON.")
 
-    try:
-        async with AsyncClient(api_key=api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
+        try:
+            async with AsyncClient(api_key=api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
 
-            @client.on(ServerMessageType.RECOGNITION_STARTED)
-            def _on_started(message: dict[str, Any]) -> None:
-                if _DEBUG:
-                    print("[DBG MSG] RECOGNITION_STARTED")
-                dot.start("idle")
+                @client.on(ServerMessageType.RECOGNITION_STARTED)
+                def _on_started(message: dict[str, Any]) -> None:
+                    if _DEBUG:
+                        ui.add_tool_use("[DBG MSG] RECOGNITION_STARTED")
+                    ui.set_status("idle")
 
-            @client.on(ServerMessageType.ADD_TRANSCRIPT)
-            def _on_final(message: dict[str, Any]) -> None:
-                controller.handle_final(message)
+                @client.on(ServerMessageType.ADD_TRANSCRIPT)
+                def _on_final(message: dict[str, Any]) -> None:
+                    controller.handle_final(message)
 
-            @client.on(ServerMessageType.END_OF_UTTERANCE)
-            def _on_eou(message: dict[str, Any]) -> None:
-                controller.handle_end_of_utterance(message)
+                @client.on(ServerMessageType.END_OF_UTTERANCE)
+                def _on_eou(message: dict[str, Any]) -> None:
+                    controller.handle_end_of_utterance(message)
 
-            @client.on(ServerMessageType.ERROR)
-            def _on_server_error(message: dict[str, Any]) -> None:
-                if _DEBUG:
-                    print("[DBG MSG] ERROR")
-                dot.stop()
-                reason = message.get("reason", "unknown")
-                print(f"[ERROR] Server error: {reason}")
-                stop_event.set()
+                @client.on(ServerMessageType.ERROR)
+                def _on_server_error(message: dict[str, Any]) -> None:
+                    if _DEBUG:
+                        ui.add_tool_use("[DBG MSG] ERROR")
+                    reason = message.get("reason", "unknown")
+                    ui.add_error_message(f"[ERROR] {reason}")
+                    stop_event.set()
 
-            await client.start_session(
-                transcription_config=transcription_config,
-                audio_format=audio_format,
-            )
-
-            pump_task = asyncio.create_task(
-                _audio_pump(
-                    client=client,
-                    mic=mic,
-                    controller=controller,
-                    chunk_size=audio_format.chunk_size,
-                    stop_event=stop_event,
-                ),
-                name="audio-pump",
-            )
-            driver_task = asyncio.create_task(
-                claude_driver(
-                    controller=controller,
-                    dot=dot,
-                    stop_event=stop_event,
-                ),
-                name="claude-driver",
-            )
-            stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
-
-            try:
-                await asyncio.wait(
-                    {pump_task, driver_task, stop_task},
-                    return_when=asyncio.FIRST_COMPLETED,
+                await client.start_session(
+                    transcription_config=transcription_config,
+                    audio_format=audio_format,
                 )
-            except asyncio.CancelledError:
-                pass
-            finally:
-                stop_event.set()
-                dot.stop()
-                pump_task.cancel()
-                driver_task.cancel()
-                stop_task.cancel()
-                for task in (pump_task, driver_task, stop_task):
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
 
-    except AuthenticationError as exc:
-        print(f"[ERROR] Authentication failed: {exc}")
-    finally:
-        mic.stop()
+                pump_task = asyncio.create_task(
+                    _audio_pump(
+                        client=client,
+                        mic=mic,
+                        controller=controller,
+                        chunk_size=audio_format.chunk_size,
+                        stop_event=stop_event,
+                    ),
+                    name="audio-pump",
+                )
+                driver_task = asyncio.create_task(
+                    claude_driver(
+                        controller=controller,
+                        ui=ui,
+                        stop_event=stop_event,
+                    ),
+                    name="claude-driver",
+                )
+                stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
+
+                try:
+                    await asyncio.wait(
+                        {pump_task, driver_task, stop_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    stop_event.set()
+                    ui.stop()
+                    pump_task.cancel()
+                    driver_task.cancel()
+                    stop_task.cancel()
+                    for task in (pump_task, driver_task, stop_task):
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+        except AuthenticationError as exc:
+            ui.add_error_message(f"[ERROR] Authentication failed: {exc}")
+            await asyncio.sleep(2)
+        finally:
+            mic.stop()
 
 
 if __name__ == "__main__":
