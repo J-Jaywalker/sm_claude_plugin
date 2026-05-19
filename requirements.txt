@@ -1,0 +1,3 @@
+speechmatics-rt
+pyaudio
+typing_extensions
