@@ -39,6 +39,7 @@ from crab.config import (
     _DOT_INTERVAL,
     _NARRATE_TAG_RE,
     _RT_URL,
+    _THINKING_LABELS,
 )
 from crab.tts.base import _extract_tts
 from crab.tts.macos import _TTS_PROVIDER_MACOS
@@ -193,7 +194,7 @@ class CrabApp(App[None]):
             color = "bright_green"
         else:
             art = _CRAB_ART["thinking"][(self._frame // 5) % 2]
-            label = "Thinking..."
+            label = _THINKING_LABELS[(self._frame // 25) % len(_THINKING_LABELS)]
             color = "bright_yellow"
         t = Text(art, style=color, justify="center")
         panel = Panel(

@@ -63,3 +63,21 @@ def _load_crab_art() -> dict[str, Any]:
 
 
 _CRAB_ART = _load_crab_art()
+
+_THINKING_LABELS: list[str] = [
+    "Snipping...",
+    "Snapping...",
+    "Rangoonin'...",
+    "Clawd-ing...",
+    "Scuttling...",
+    "Pinching...",
+    "Shelling...",
+    "Nipping...",
+    "Pondering...",
+    "Molting...",
+    "Scripting...",
+    "Hermit-ing...",
+    "Crabbing...",
+    "Crab moding...",
+    "Clawpilling...",
+]
