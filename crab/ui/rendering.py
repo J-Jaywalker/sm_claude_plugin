@@ -51,6 +51,9 @@ class _Bubble:
 
     Uses render-based measurement for Markdown content (which lacks
     __rich_measure__), and Measurement.get for plain Text and similar.
+
+    ``bg`` sets a Rich style string for the panel background so bubbles
+    appear solid over the rain animation layer.
     """
 
     def __init__(

@@ -219,6 +219,7 @@ class SettingsModal(ModalScreen[None]):
             self._tts_provider = (
                 _TTS_PROVIDER_PYTHON if pressed.id == "rb-python" else _TTS_PROVIDER_MACOS
             )
+
         enrolled_labels = {label for ids in self._speakers.values() for label in ids}
         # Late import to avoid circular dependency: crab.ui.app imports this module.
         from crab.ui.app import CrabApp
