@@ -82,3 +82,4 @@ async def claude_driver(
 
         ui.set_status("idle")
         controller.listening.set()
+        controller.response_done.set()

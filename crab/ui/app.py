@@ -71,6 +71,9 @@ class CrabApp(App[None]):
             tts_provider: str,
             enrolled_labels: set[str],
             device_index: int | None = None,
+            local_wake_word: bool = False,
+            wake_word_model: str = "",
+            wake_word_threshold: float = 0.5,
         ) -> None:
             super().__init__()
             self.rt_url = rt_url
@@ -78,6 +81,9 @@ class CrabApp(App[None]):
             self.tts_provider = tts_provider
             self.enrolled_labels = enrolled_labels
             self.device_index = device_index
+            self.local_wake_word = local_wake_word
+            self.wake_word_model = wake_word_model
+            self.wake_word_threshold = wake_word_threshold
 
     CSS = """
     Horizontal#top {
@@ -147,6 +153,9 @@ class CrabApp(App[None]):
         self._tts_enabled: bool = True
         self._tts_provider: str = _TTS_PROVIDER_MACOS
         self._device_index: int | None = None
+        self._local_wake_word: bool = False
+        self._wake_word_model: str = ""
+        self._wake_word_threshold: float = 0.5
         self._narrate_scan_buf: str = ""
 
     def compose(self) -> ComposeResult:
@@ -203,23 +212,23 @@ class CrabApp(App[None]):
         t = Text(art, style=color, justify="center")
         panel = Panel(
             Align.center(t, vertical="middle"),
-            title="[bold]CRAB VISUALISER[/bold]",
             subtitle=f"[{color}]{label}[/{color}]",
             border_style=color,
         )
         self.query_one("#visualiser", Static).update(panel)
 
     def _render_instructions(self) -> None:
-        t = Text(justify="left")
-        t.append("How to use\n\n", style="bold")
-        t.append("1. ", style="dim"); t.append('Say "CRAB-BOT"\n')
-        t.append("2. ", style="dim"); t.append("Speak your command naturally\n")
-        t.append("3. ", style="dim"); t.append("Pause — end of speech is detected automatically\n")
-        t.append("4. ", style="dim"); t.append("Wait for Claude to respond\n")
-        t.append("5. ", style="dim"); t.append('Say "CRAB-BOT" again for your next command')
+        art = (
+            "  ___    ____      __      ____ \n"
+            " / __)  (  _ \\    /__\\    (  _ \\\n"
+            "( (__    )   /   /(__)\\    ) _ <\n"
+            " \\___)()(_)\\_)()(__)(__)()(____/"
+        )
+        t = Text(justify="center")
+        t.append(art, style="bold #29A383")
+        t.append("\n\n--{ via Speechmatics }--", style="dim")
         panel = Panel(
             Align.center(t, vertical="middle"),
-            title="[bold]C.R.A.B — Claude Realtime Audio Bot[/bold]",
             border_style="dim",
         )
         self.query_one("#instructions", Static).update(panel)
@@ -324,6 +333,9 @@ class CrabApp(App[None]):
                         tts_enabled=self._tts_enabled,
                         tts_provider=self._tts_provider,
                         device_index=self._device_index,
+                        local_wake_word=self._local_wake_word,
+                        wake_word_model=self._wake_word_model,
+                        wake_word_threshold=self._wake_word_threshold,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -364,6 +376,9 @@ class CrabApp(App[None]):
         self._tts_provider = event.tts_provider
         self._enrolled_labels = event.enrolled_labels
         self._device_index = event.device_index
+        self._local_wake_word = event.local_wake_word
+        self._wake_word_model = event.wake_word_model
+        self._wake_word_threshold = event.wake_word_threshold
         if self._controller is not None:
             self._controller.enrolled_labels = event.enrolled_labels
 
@@ -515,8 +530,52 @@ class CrabApp(App[None]):
 
     async def _run_speechmatics(self) -> None:
         assert self._stop_event is not None
-        stop_event = self._stop_event
+        if self._local_wake_word:
+            await self._run_with_local_wake_word(self._stop_event)
+        else:
+            await self._run_sm_session(self._stop_event)
+
+        if not self._exiting and not self._restarting_sm:
+            self.exit()
+
+    async def _run_with_local_wake_word(self, stop_event: asyncio.Event) -> None:
+        from crab.asr.wake_word import OpenWakeWordDetector
+        detector = OpenWakeWordDetector(
+            model=self._wake_word_model,
+            threshold=self._wake_word_threshold,
+        )
+        while not stop_event.is_set():
+            self.set_status("idle")
+            try:
+                detected = await detector.wait_for_wake(self._device_index, stop_event)
+            except Exception as exc:
+                self.add_error_message(f"[ERROR] Wake word detector: {exc}")
+                return
+            if not detected:
+                return
+            # Transition to listening (triggers Ping sound) then run one command cycle.
+            self.set_status("listening")
+            session_stop = asyncio.Event()
+            await self._run_sm_session(stop_event, session_stop=session_stop, one_shot=True)
+            if not stop_event.is_set():
+                await asyncio.sleep(0.5)
+
+    async def _run_sm_session(
+        self,
+        stop_event: asyncio.Event,
+        session_stop: asyncio.Event | None = None,
+        one_shot: bool = False,
+    ) -> None:
+        """One Speechmatics connection lifetime.
+
+        In *one_shot* mode the session ends automatically after the first
+        complete response cycle (used when local wake word pre-fires the
+        trigger).  Otherwise it runs until *stop_event* is set.
+        """
         controller = VoiceController(enrolled_labels=self._enrolled_labels, ui=self)
+        if one_shot:
+            # Wake word already detected locally — skip SM-side wake word detection.
+            controller.state = _State.ACCUMULATING
         self._controller = controller
 
         mic = Microphone(
@@ -535,7 +594,8 @@ class CrabApp(App[None]):
                 def _on_started(message: dict[str, Any]) -> None:
                     if _DEBUG:
                         self.add_tool_use("[DBG MSG] RECOGNITION_STARTED")
-                    self.set_status("idle")
+                    if not one_shot:
+                        self.set_status("idle")
 
                 @client.on(ServerMessageType.ADD_TRANSCRIPT)
                 def _on_final(message: dict[str, Any]) -> None:
@@ -552,6 +612,8 @@ class CrabApp(App[None]):
                     reason = message.get("reason", "unknown")
                     self.add_error_message(f"[ERROR] {reason}")
                     stop_event.set()
+                    if session_stop is not None:
+                        session_stop.set()
 
                 await client.start_session(
                     transcription_config=self._transcription_config,
@@ -579,23 +641,45 @@ class CrabApp(App[None]):
                     ),
                     name="claude-driver",
                 )
-                stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
+
+                if one_shot and session_stop is not None:
+                    async def _one_shot_watch() -> None:
+                        await controller.response_done.wait()
+                        session_stop.set()
+
+                    async def _either_stop() -> None:
+                        t1 = asyncio.create_task(stop_event.wait())
+                        t2 = asyncio.create_task(session_stop.wait())
+                        try:
+                            await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            t1.cancel()
+                            t2.cancel()
+
+                    watcher_task: asyncio.Task[None] | None = asyncio.create_task(
+                        _one_shot_watch(), name="one-shot-watch"
+                    )
+                    stop_task = asyncio.create_task(_either_stop(), name="stop-wait")
+                else:
+                    watcher_task = None
+                    stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
+
+                all_tasks: set[asyncio.Task[Any]] = {pump_task, driver_task, stop_task}
+                if watcher_task is not None:
+                    all_tasks.add(watcher_task)
 
                 try:
-                    await asyncio.wait(
-                        {pump_task, driver_task, stop_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
                 finally:
-                    stop_event.set()
-                    pump_task.cancel()
-                    driver_task.cancel()
-                    stop_task.cancel()
-                    for task in (pump_task, driver_task, stop_task):
+                    if not one_shot:
+                        stop_event.set()
+                    for task in all_tasks:
+                        task.cancel()
+                    for task in all_tasks:
                         try:
                             await task
                         except (asyncio.CancelledError, Exception):
-                            pass  # we initiated cancellation — safe to swallow
+                            pass
                     try:
                         await asyncio.wait_for(client.stop_session(), timeout=3.0)
                     except Exception:
@@ -606,6 +690,3 @@ class CrabApp(App[None]):
             await asyncio.sleep(2)
         finally:
             mic.stop()
-
-        if not self._exiting and not self._restarting_sm:
-            self.exit()

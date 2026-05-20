@@ -108,8 +108,9 @@ class SettingsModal(ModalScreen[None]):
     CSS = """
     SettingsModal { align: center middle; }
     #settings-container {
-        width: 72; height: auto; max-height: 90vh;
+        width: 72; height: 90vh;
         background: $surface; border: round #29A383; padding: 1 2;
+        overflow-y: auto;
     }
     #settings-title {
         text-align: center; color: #29A383;
@@ -128,6 +129,10 @@ class SettingsModal(ModalScreen[None]):
     #tts-row { height: 3; margin-top: 1; }
     #tts-switch { margin-right: 2; }
     RadioSet { margin-top: 1; margin-bottom: 0; }
+    #lww-row { height: 3; margin-top: 1; }
+    #lww-switch { margin-right: 2; }
+    #lww-model { margin-top: 1; margin-bottom: 0; }
+    #lww-threshold { margin-top: 1; margin-bottom: 0; }
     #btn-row { margin-top: 2; height: 3; }
     #save-btn   { width: 1fr; margin-right: 1; }
     #cancel-btn { width: 1fr; }
@@ -141,6 +146,9 @@ class SettingsModal(ModalScreen[None]):
         tts_enabled: bool,
         tts_provider: str,
         device_index: int | None = None,
+        local_wake_word: bool = False,
+        wake_word_model: str = "",
+        wake_word_threshold: float = 0.5,
     ) -> None:
         super().__init__()
         self._api_key = api_key
@@ -149,6 +157,9 @@ class SettingsModal(ModalScreen[None]):
         self._tts_enabled = tts_enabled
         self._tts_provider = tts_provider
         self._device_index = device_index
+        self._local_wake_word = local_wake_word
+        self._wake_word_model = wake_word_model
+        self._wake_word_threshold = wake_word_threshold
         self._speakers: dict[str, list[str]] = _load_speakers()
         self._level_task: asyncio.Task[None] | None = None
         self._level_stream: Any = None
@@ -195,6 +206,27 @@ class SettingsModal(ModalScreen[None]):
                     disabled=True,
                     id="rb-python",
                 )
+
+            yield Label("Local Wake Word", classes="section-label")
+            with Horizontal(id="lww-row"):
+                yield Switch(value=self._local_wake_word, id="lww-switch")
+                yield Label(" Enable local wake word detection", id="lww-switch-label")
+            yield Label(
+                "Model name or path to custom .onnx  "
+                "[dim](hey_jarvis_v0.1 · alexa_v0.1 · hey_mycroft_v0.1 · hey_rhasspy_v0.1)[/dim]",
+                classes="hint",
+            )
+            yield Input(
+                value=self._wake_word_model,
+                placeholder="hey_jarvis_v0.1",
+                id="lww-model",
+            )
+            yield Label("Detection threshold (0.1 – 1.0)", classes="hint")
+            yield Input(
+                value=str(self._wake_word_threshold),
+                placeholder="0.5",
+                id="lww-threshold",
+            )
 
             with Horizontal(id="btn-row"):
                 yield Button("Save", id="save-btn", variant="success")
@@ -364,6 +396,15 @@ class SettingsModal(ModalScreen[None]):
         raw = self.query_one("#device-select", Select).value
         device_index = None if raw == _DEVICE_DEFAULT or raw == Select.BLANK else int(raw)
 
+        local_wake_word = self.query_one("#lww-switch", Switch).value
+        wake_word_model = self.query_one("#lww-model", Input).value.strip()
+        try:
+            wake_word_threshold = max(0.1, min(1.0, float(
+                self.query_one("#lww-threshold", Input).value
+            )))
+        except ValueError:
+            wake_word_threshold = 0.5
+
         enrolled_labels = set(self._speakers.keys())
         # Late import to avoid circular dependency: crab.ui.app imports this module.
         from crab.ui.app import CrabApp
@@ -374,6 +415,9 @@ class SettingsModal(ModalScreen[None]):
                 tts_provider=self._tts_provider,
                 enrolled_labels=enrolled_labels,
                 device_index=device_index,
+                local_wake_word=local_wake_word,
+                wake_word_model=wake_word_model,
+                wake_word_threshold=wake_word_threshold,
             )
         )
         self.dismiss(None)

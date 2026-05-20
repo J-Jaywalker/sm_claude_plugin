@@ -3,3 +3,4 @@ pyaudio
 rich
 textual
 typing_extensions
+openwakeword

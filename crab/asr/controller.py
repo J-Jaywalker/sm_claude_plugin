@@ -45,6 +45,7 @@ class VoiceController:
         self.listening.set()
         self.prompt_ready: asyncio.Event = asyncio.Event()
         self.last_prompt: str = ""
+        self.response_done: asyncio.Event = asyncio.Event()
 
     def handle_final(self, message: dict[str, Any]) -> None:
         """Handle an ADD_TRANSCRIPT (final) server message."""
