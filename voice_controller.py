@@ -58,6 +58,7 @@ from speechmatics.rt import (
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _TTS_TAG_RE = re.compile(r"<tts>(.*?)</tts>", re.DOTALL | re.IGNORECASE)
+_NARRATE_TAG_RE = re.compile(r"<narrate>(.*?)</narrate>", re.DOTALL | re.IGNORECASE)
 _WAKE_WORD_PATTERN = re.compile(r"\bcrab[\s\-]+bot\b")
 _DEBUG = bool(os.environ.get("DEBUG"))
 _IDLE_BUFFER_MAX = 120
@@ -638,6 +639,7 @@ class CrabApp(App[None]):
         self._rt_url: str | None = _RT_URL
         self._tts_enabled: bool = True
         self._tts_provider: str = _TTS_PROVIDER_MACOS
+        self._narrate_scan_buf: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -737,14 +739,18 @@ class CrabApp(App[None]):
                             text_chunks.append(seg)
                         else:
                             if text_chunks:
-                                combined = "".join(text_chunks)
+                                combined = _NARRATE_TAG_RE.sub(
+                                    "", "".join(text_chunks)
+                                ).strip()
                                 display_text, _ = _extract_tts(combined)
                                 if display_text:
                                     parts.append(Markdown(display_text))
                                 text_chunks = []
                             parts.append(Text(seg, style="dim"))
                     if text_chunks:
-                        combined = "".join(text_chunks)
+                        combined = _NARRATE_TAG_RE.sub(
+                            "", "".join(text_chunks)
+                        ).strip()
                         display_text, _ = _extract_tts(combined)
                         if display_text:
                             parts.append(Markdown(display_text))
@@ -777,6 +783,10 @@ class CrabApp(App[None]):
         stop is intentional and it must NOT call ``self.exit()`` when it
         returns — otherwise clicking Settings would shut the app down.
         """
+        if self._status == "thinking":
+            self.notify("Please wait for CRAB-BOT to finish responding.", severity="warning")
+            return
+
         self._restarting_sm = True
         try:
             if self._stop_event is not None:
@@ -866,8 +876,38 @@ class CrabApp(App[None]):
         if self._history and self._history[-1]["role"] == "assistant":
             self._history[-1]["segments"].append(("text", clean))
         else:
+            self._narrate_scan_buf = ""
             self._history.append({"role": "assistant", "segments": [("text", clean)]})
+        self._process_narrate_stream(clean)
         self._render_history()
+
+    def _process_narrate_stream(self, new_text: str) -> None:
+        """Scan streaming text for ``<narrate>`` tags and speak them.
+
+        Appends the incoming chunk to a running scan buffer, extracts any
+        complete ``<narrate>...</narrate>`` blocks, and fires a TTS task
+        for each. Truncates the buffer once consumed (or when it grows
+        large with no open ``<narrate`` prefix) so memory stays bounded.
+
+        Args:
+            new_text: Newly arrived assistant text segment, already
+                ANSI-stripped.
+        """
+        self._narrate_scan_buf += new_text
+        matches = list(_NARRATE_TAG_RE.finditer(self._narrate_scan_buf))
+        for m in matches:
+            narrate_text = m.group(1).strip()
+            if narrate_text:
+                asyncio.create_task(
+                    self._speak(narrate_text), name="tts-narrate"
+                )
+        if matches:
+            self._narrate_scan_buf = self._narrate_scan_buf[matches[-1].end():]
+        elif (
+            len(self._narrate_scan_buf) > 500
+            and "<narrate" not in self._narrate_scan_buf
+        ):
+            self._narrate_scan_buf = ""
 
     def add_tool_use(self, label: str) -> None:
         if label.startswith("[DONE]"):
@@ -892,7 +932,7 @@ class CrabApp(App[None]):
             if not text_chunks:
                 msg["tts"] = ""
                 return
-            combined = "".join(text_chunks)
+            combined = _NARRATE_TAG_RE.sub("", "".join(text_chunks))
             _, tts_text = _extract_tts(combined)
             msg["tts"] = tts_text
             if tts_text:
@@ -916,7 +956,7 @@ class CrabApp(App[None]):
         if self._tts_provider == _TTS_PROVIDER_MACOS:
             try:
                 self._tts_proc = await asyncio.create_subprocess_exec(
-                    "say", text,
+                    "say", "-v", "Daniel (Enhanced)", text,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
