@@ -69,12 +69,14 @@ class CrabApp(App[None]):
             tts_enabled: bool,
             tts_provider: str,
             enrolled_labels: set[str],
+            device_index: int | None = None,
         ) -> None:
             super().__init__()
             self.rt_url = rt_url
             self.tts_enabled = tts_enabled
             self.tts_provider = tts_provider
             self.enrolled_labels = enrolled_labels
+            self.device_index = device_index
 
     CSS = """
     Horizontal#top {
@@ -143,6 +145,7 @@ class CrabApp(App[None]):
         self._rt_url: str | None = _RT_URL
         self._tts_enabled: bool = True
         self._tts_provider: str = _TTS_PROVIDER_MACOS
+        self._device_index: int | None = None
         self._narrate_scan_buf: str = ""
 
     def compose(self) -> ComposeResult:
@@ -319,12 +322,17 @@ class CrabApp(App[None]):
                         rt_url=self._rt_url,
                         tts_enabled=self._tts_enabled,
                         tts_provider=self._tts_provider,
+                        device_index=self._device_index,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
                 self.add_error_message(f"[ERROR] Settings: {exc}")
         finally:
             self._restarting_sm = False
+
+        # Yield to the event loop so any SettingsChanged message is processed
+        # before the new ASR session reads self._device_index / self._rt_url.
+        await asyncio.sleep(0)
 
         # Restart the main ASR session regardless of whether settings were saved.
         if not self._exiting:
@@ -354,6 +362,7 @@ class CrabApp(App[None]):
         self._tts_enabled = event.tts_enabled
         self._tts_provider = event.tts_provider
         self._enrolled_labels = event.enrolled_labels
+        self._device_index = event.device_index
         if self._controller is not None:
             self._controller.enrolled_labels = event.enrolled_labels
 
@@ -499,6 +508,7 @@ class CrabApp(App[None]):
         mic = Microphone(
             sample_rate=self._audio_format.sample_rate,
             chunk_size=self._audio_format.chunk_size,
+            device_index=self._device_index,
         )
         if not mic.start():
             self.add_error_message("[ERROR] Microphone not available — install with `pip install pyaudio`.")

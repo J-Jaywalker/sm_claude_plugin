@@ -26,6 +26,7 @@ async def _enroll_speaker_tui(
     name: str,
     on_status: Any,
     rt_url: str | None = None,
+    device_index: int | None = None,
 ) -> dict[str, list[str]]:
     """Run a 30-second enrollment session, updating *on_status* with progress.
 
@@ -45,7 +46,11 @@ async def _enroll_speaker_tui(
     loop = asyncio.get_event_loop()
     speakers_future: asyncio.Future[list[dict[str, Any]]] = loop.create_future()
 
-    mic = Microphone(sample_rate=audio_format.sample_rate, chunk_size=audio_format.chunk_size)
+    mic = Microphone(
+        sample_rate=audio_format.sample_rate,
+        chunk_size=audio_format.chunk_size,
+        device_index=device_index,
+    )
     if not mic.start():
         raise RuntimeError("Microphone not available")
 
