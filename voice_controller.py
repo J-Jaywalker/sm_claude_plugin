@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 from collections import deque
@@ -33,8 +34,11 @@ from rich.panel import Panel
 from rich.text import Text
 
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Input, Static
+from textual.message import Message
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Label, RadioButton, RadioSet, Static, Switch
+from textual import work
 
 from speechmatics.rt import (
     AsyncClient,
@@ -53,6 +57,7 @@ from speechmatics.rt import (
 
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_TTS_TAG_RE = re.compile(r"<tts>(.*?)</tts>", re.DOTALL | re.IGNORECASE)
 _WAKE_WORD_PATTERN = re.compile(r"\bcrab[\s\-]+bot\b")
 _DEBUG = bool(os.environ.get("DEBUG"))
 _IDLE_BUFFER_MAX = 120
@@ -62,7 +67,7 @@ _ENROLLMENT_SECONDS = 30
 
 _RT_URL = "ws://127.0.0.1:9002/v2" if os.environ.get("SM_LOCAL_CLAUDE_TRANSCRIPTION") else None
 
-_SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+_SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "assets", "system_prompt.md")
 
 def _load_system_prompt() -> str:
     try:
@@ -73,7 +78,7 @@ def _load_system_prompt() -> str:
 
 _DOT_INTERVAL = 0.2
 
-_CRAB_ART_FILE = os.path.join(os.path.dirname(__file__), "crab_art.txt")
+_CRAB_ART_FILE = os.path.join(os.path.dirname(__file__), "assets", "crab_art.txt")
 
 
 def _load_crab_art() -> dict[str, Any]:
@@ -106,6 +111,33 @@ def _load_crab_art() -> dict[str, Any]:
 
 
 _CRAB_ART = _load_crab_art()
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _extract_tts(text: str) -> tuple[str, str]:
+    """Return ``(display_text, tts_text)`` parsed from assistant output.
+
+    Strips any ``<tts>...</tts>`` block from ``text`` to form the
+    display text, and returns the inner contents as the spoken TTS
+    text. If no ``<tts>`` block is present, ``tts_text`` is empty and
+    ``display_text`` equals the input.
+
+    Args:
+        text: Raw assistant output, possibly containing a ``<tts>``
+            block at the end.
+
+    Returns:
+        A tuple ``(display_text, tts_text)``. ``display_text`` has the
+        ``<tts>`` block (and surrounding trailing whitespace) removed.
+    """
+    match = _TTS_TAG_RE.search(text)
+    if not match:
+        return text, ""
+    tts_text = match.group(1).strip()
+    display_text = _TTS_TAG_RE.sub("", text).rstrip()
+    return display_text, tts_text
 
 
 # ---------------------------------------------------------------------------
@@ -204,16 +236,312 @@ class _UI(Protocol):
 # ---------------------------------------------------------------------------
 
 class SettingsPanel(Static):
-    """Square panel in the top-right corner. Green normally, orange on hover.
-    Colours and hover are handled entirely by Textual CSS — no Rich re-render."""
+    """Square panel in the top-right corner. Green normally, orange on hover."""
 
     can_focus = False
+
+    class OpenSettings(Message):
+        pass
 
     def on_mount(self) -> None:
         self.update("SETTINGS")
 
     def on_click(self) -> None:
-        pass  # TODO: open settings panel
+        self.post_message(self.OpenSettings())
+
+
+# ---------------------------------------------------------------------------
+# Enrollment modal
+# ---------------------------------------------------------------------------
+
+async def _enroll_speaker_tui(
+    api_key: str,
+    audio_format: AudioFormat,
+    name: str,
+    on_status: Any,
+    rt_url: str | None = None,
+) -> dict[str, list[str]]:
+    """Run a 30-second enrollment session, updating *on_status* with progress.
+
+    *on_status* is a callable(str) that accepts a status string (plain text).
+    Returns the enrolled speakers dict and saves it to disk.
+    """
+    enrollment_config = TranscriptionConfig(
+        language="en",
+        operating_point=OperatingPoint.ENHANCED,
+        diarization="speaker",
+        max_delay=1.0,
+        additional_vocab=[
+            {"content": "CRAB-BOT", "sounds_like": ["crab bot", "grab bot", "crab bought"]},
+        ],
+    )
+
+    loop = asyncio.get_event_loop()
+    speakers_future: asyncio.Future[list[dict[str, Any]]] = loop.create_future()
+
+    mic = Microphone(sample_rate=audio_format.sample_rate, chunk_size=audio_format.chunk_size)
+    if not mic.start():
+        raise RuntimeError("Microphone not available")
+
+    try:
+        async with AsyncClient(api_key=api_key, **({"url": rt_url} if rt_url else {})) as client:
+
+            @client.on(ServerMessageType.SPEAKERS_RESULT)
+            def _on_speakers(msg: dict[str, Any]) -> None:
+                if not speakers_future.done():
+                    speakers_future.set_result(msg.get("speakers", []))
+
+            await client.start_session(
+                transcription_config=enrollment_config,
+                audio_format=audio_format,
+            )
+
+            stop_pump = asyncio.Event()
+            pump_task = asyncio.create_task(
+                _audio_pump_raw(client, mic, audio_format.chunk_size, stop_pump)
+            )
+
+            for remaining in range(_ENROLLMENT_SECONDS, 0, -1):
+                on_status(f"Recording as '{name}'... {remaining}s remaining — speak naturally")
+                await asyncio.sleep(1)
+
+            stop_pump.set()
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+
+            on_status("Processing speaker identifiers...")
+            await client.send_message({"message": ClientMessageType.GET_SPEAKERS})
+
+            try:
+                raw_speakers = await asyncio.wait_for(speakers_future, timeout=10.0)
+            except asyncio.TimeoutError:
+                raw_speakers = []
+    finally:
+        mic.stop()
+
+    if not raw_speakers:
+        raise RuntimeError("Enrollment failed: no speaker identifiers detected")
+
+    best = max(raw_speakers, key=lambda s: len(s.get("speaker_identifiers", [])))
+    enrolled = {name: best["speaker_identifiers"]}
+    _save_speakers(enrolled)
+    return enrolled
+
+
+class EnrollModal(ModalScreen[dict[str, list[str]] | None]):
+    """Sub-screen for the 30-second speaker recording flow."""
+
+    CSS = """
+    EnrollModal { align: center middle; }
+    #enroll-container {
+        width: 64; height: auto;
+        background: $surface; border: round #29A383; padding: 1 2;
+    }
+    #enroll-title { text-align: center; color: #29A383; margin-bottom: 1; }
+    #enroll-name  { margin-bottom: 1; }
+    #enroll-start { width: 100%; margin-bottom: 1; }
+    #enroll-status { text-align: center; }
+    """
+
+    def __init__(self, api_key: str, audio_format: AudioFormat, rt_url: str | None) -> None:
+        super().__init__()
+        self._api_key = api_key
+        self._audio_format = audio_format
+        self._rt_url = rt_url
+        self._recording = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="enroll-container"):
+            yield Label("Register New Speaker", id="enroll-title")
+            yield Input(placeholder="Enter your name...", id="enroll-name")
+            yield Button("Start 30s Recording", id="enroll-start", variant="success")
+            yield Label("", id="enroll-status")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "enroll-start" and not self._recording:
+            name = self.query_one("#enroll-name", Input).value.strip() or "owner"
+            self._recording = True
+            self.query_one("#enroll-start", Button).disabled = True
+            asyncio.create_task(self._run(name))
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "escape" and not self._recording:
+            self.dismiss(None)
+
+    async def _run(self, name: str) -> None:
+        status = self.query_one("#enroll-status", Label)
+        try:
+            enrolled = await _enroll_speaker_tui(
+                self._api_key, self._audio_format, name,
+                lambda msg: status.update(msg),
+                rt_url=self._rt_url,
+            )
+            status.update(f"[green]'{name}' enrolled successfully![/green]")
+            await asyncio.sleep(1.5)
+            self.dismiss(enrolled)
+        except Exception as exc:
+            status.update(f"[red]Error: {exc}[/red]")
+            self._recording = False
+            self.query_one("#enroll-start", Button).disabled = False
+
+
+_TTS_PROVIDER_MACOS = "macos"
+_TTS_PROVIDER_PYTHON = "python"
+
+
+class SettingsModal(ModalScreen[None]):
+    """Full settings screen: endpoint, speaker enrollment, TTS options."""
+
+    CSS = """
+    SettingsModal { align: center middle; }
+    #settings-container {
+        width: 72; height: auto; max-height: 90vh;
+        background: $surface; border: round #29A383; padding: 1 2;
+    }
+    #settings-title {
+        text-align: center; color: #29A383;
+        text-style: bold; margin-bottom: 1;
+    }
+    .section-label { text-style: bold; color: $text; margin-top: 1; }
+    .hint { color: $text-muted; margin-bottom: 1; }
+    #endpoint-input { margin-bottom: 0; }
+    #speakers-list { margin-top: 1; height: auto; }
+    .speaker-row { height: 3; margin-bottom: 0; }
+    .speaker-name { width: 1fr; height: 3; content-align: left middle; padding-left: 1; }
+    .delete-btn { width: 10; height: 3; }
+    #enroll-btn { width: 100%; margin-top: 1; }
+    #tts-row { height: 3; margin-top: 1; }
+    #tts-switch { margin-right: 2; }
+    RadioSet { margin-top: 1; margin-bottom: 0; }
+    #btn-row { margin-top: 2; height: 3; }
+    #save-btn   { width: 1fr; margin-right: 1; }
+    #cancel-btn { width: 1fr; }
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        audio_format: AudioFormat,
+        rt_url: str | None,
+        tts_enabled: bool,
+        tts_provider: str,
+    ) -> None:
+        super().__init__()
+        self._api_key = api_key
+        self._audio_format = audio_format
+        self._rt_url = rt_url
+        self._tts_enabled = tts_enabled
+        self._tts_provider = tts_provider
+        self._speakers: dict[str, list[str]] = _load_speakers()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-container"):
+            yield Label("CRAB-BOT Settings", id="settings-title")
+
+            yield Label("Transcription Endpoint", classes="section-label")
+            yield Label("Leave empty to use the Speechmatics cloud default", classes="hint")
+            yield Input(
+                value=self._rt_url or "",
+                placeholder="wss://eu2.rt.speechmatics.com/v2",
+                id="endpoint-input",
+            )
+
+            yield Label("Enrolled Speakers", classes="section-label")
+            yield Vertical(id="speakers-list")
+            yield Button("Register New Speaker", id="enroll-btn", variant="primary")
+
+            yield Label("Text-to-Speech", classes="section-label")
+            with Horizontal(id="tts-row"):
+                yield Switch(value=self._tts_enabled, id="tts-switch")
+                yield Label(" Enabled", id="tts-switch-label")
+            with RadioSet(id="tts-provider"):
+                yield RadioButton(
+                    "macOS built-in (say)",
+                    value=(self._tts_provider == _TTS_PROVIDER_MACOS),
+                    id="rb-macos",
+                )
+                yield RadioButton(
+                    "Python offline — planned",
+                    value=(self._tts_provider == _TTS_PROVIDER_PYTHON),
+                    disabled=True,
+                    id="rb-python",
+                )
+
+            with Horizontal(id="btn-row"):
+                yield Button("Save", id="save-btn", variant="success")
+                yield Button("Cancel", id="cancel-btn")
+
+    def on_mount(self) -> None:
+        self._rebuild_speakers()
+
+    def _rebuild_speakers(self) -> None:
+        container = self.query_one("#speakers-list", Vertical)
+        for child in list(container.children):
+            child.remove()
+        if not self._speakers:
+            container.mount(Label("  No speakers enrolled", classes="hint"))
+            return
+        for i, (name, ids) in enumerate(self._speakers.items()):
+            id_count = len(ids)
+            row = Horizontal(classes="speaker-row")
+            container.mount(row)
+            row.mount(Label(
+                f"  {name}  [dim]({id_count} identifier{'s' if id_count != 1 else ''})[/dim]",
+                classes="speaker-name",
+            ))
+            row.mount(Button("Remove", id=f"del-spk-{i}", classes="delete-btn", variant="error"))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        if btn_id.startswith("del-spk-"):
+            idx = int(btn_id.split("-")[-1])
+            name = list(self._speakers.keys())[idx]
+            del self._speakers[name]
+            _save_speakers(self._speakers)
+            self._rebuild_speakers()
+        elif btn_id == "enroll-btn":
+            rt_url = self.query_one("#endpoint-input", Input).value.strip() or None
+            self.app.push_screen(
+                EnrollModal(self._api_key, self._audio_format, rt_url),
+                self._on_enrolled,
+            )
+        elif btn_id == "save-btn":
+            self._save_and_close()
+        elif btn_id == "cancel-btn":
+            self.dismiss(None)
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+    def _on_enrolled(self, result: dict[str, list[str]] | None) -> None:
+        if result:
+            self._speakers.update(result)
+            self._rebuild_speakers()
+            name = next(iter(result))
+            self.app.notify(f"'{name}' enrolled", severity="information")
+
+    def _save_and_close(self) -> None:
+        self._rt_url = self.query_one("#endpoint-input", Input).value.strip() or None
+        self._tts_enabled = self.query_one("#tts-switch", Switch).value
+        pressed = self.query_one("#tts-provider", RadioSet).pressed_button
+        if pressed is not None:
+            self._tts_provider = (
+                _TTS_PROVIDER_PYTHON if pressed.id == "rb-python" else _TTS_PROVIDER_MACOS
+            )
+        enrolled_labels = {label for ids in self._speakers.values() for label in ids}
+        self.app.post_message(
+            CrabApp.SettingsChanged(
+                rt_url=self._rt_url,
+                tts_enabled=self._tts_enabled,
+                tts_provider=self._tts_provider,
+                enrolled_labels=enrolled_labels,
+            )
+        )
+        self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +553,21 @@ class CrabApp(App[None]):
 
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [("ctrl+c", "quit", "Quit"), ("ctrl+q", "quit", "Quit")]
+
+    class SettingsChanged(Message):
+        """Posted by SettingsModal when the user saves new settings."""
+        def __init__(
+            self,
+            rt_url: str | None,
+            tts_enabled: bool,
+            tts_provider: str,
+            enrolled_labels: set[str],
+        ) -> None:
+            super().__init__()
+            self.rt_url = rt_url
+            self.tts_enabled = tts_enabled
+            self.tts_provider = tts_provider
+            self.enrolled_labels = enrolled_labels
 
     CSS = """
     Horizontal#top {
@@ -288,8 +631,13 @@ class CrabApp(App[None]):
         self._frame = 0
         self._stop_event: asyncio.Event | None = None
         self._sm_task: asyncio.Task[None] | None = None
+        self._tts_proc: asyncio.subprocess.Process | None = None
         self._controller: VoiceController | None = None
         self._exiting = False
+        self._restarting_sm = False
+        self._rt_url: str | None = _RT_URL
+        self._tts_enabled: bool = True
+        self._tts_provider: str = _TTS_PROVIDER_MACOS
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -315,6 +663,11 @@ class CrabApp(App[None]):
         self._exiting = True
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._tts_proc is not None:
+            try:
+                self._tts_proc.kill()
+            except Exception:
+                pass
 
     # -- Animation tick -----------------------------------------------------
 
@@ -384,11 +737,17 @@ class CrabApp(App[None]):
                             text_chunks.append(seg)
                         else:
                             if text_chunks:
-                                parts.append(Markdown("".join(text_chunks)))
+                                combined = "".join(text_chunks)
+                                display_text, _ = _extract_tts(combined)
+                                if display_text:
+                                    parts.append(Markdown(display_text))
                                 text_chunks = []
                             parts.append(Text(seg, style="dim"))
                     if text_chunks:
-                        parts.append(Markdown("".join(text_chunks)))
+                        combined = "".join(text_chunks)
+                        display_text, _ = _extract_tts(combined)
+                        if display_text:
+                            parts.append(Markdown(display_text))
                     items.append(_Bubble(
                         Group(*parts) if parts else Text(""),
                         align="right",
@@ -406,6 +765,65 @@ class CrabApp(App[None]):
         self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
     # -- Input / settings event handlers ------------------------------------
+
+    def on_settings_panel_open_settings(self, event: SettingsPanel.OpenSettings) -> None:
+        self._settings_flow()
+
+    @work(exit_on_error=False)
+    async def _settings_flow(self) -> None:
+        """Pause ASR, show the settings modal, then resume ASR.
+
+        Setting ``self._restarting_sm`` tells ``_run_speechmatics`` that the
+        stop is intentional and it must NOT call ``self.exit()`` when it
+        returns — otherwise clicking Settings would shut the app down.
+        """
+        self._restarting_sm = True
+        try:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._sm_task is not None and not self._sm_task.done():
+                try:
+                    await asyncio.wait_for(self._sm_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    self._sm_task.cancel()
+                    try:
+                        await self._sm_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._controller = None
+            self.set_status("idle")
+
+            try:
+                await self.push_screen_wait(
+                    SettingsModal(
+                        api_key=self._api_key,
+                        audio_format=self._audio_format,
+                        rt_url=self._rt_url,
+                        tts_enabled=self._tts_enabled,
+                        tts_provider=self._tts_provider,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.add_error_message(f"[ERROR] Settings: {exc}")
+        finally:
+            self._restarting_sm = False
+
+        # Restart the main ASR session regardless of whether settings were saved.
+        if not self._exiting:
+            self._stop_event = asyncio.Event()
+            self._sm_task = asyncio.create_task(
+                self._run_speechmatics(), name="speechmatics"
+            )
+
+    def on_crab_app_settings_changed(self, event: "CrabApp.SettingsChanged") -> None:
+        self._rt_url = event.rt_url
+        self._tts_enabled = event.tts_enabled
+        self._tts_provider = event.tts_provider
+        self._enrolled_labels = event.enrolled_labels
+        if self._controller is not None:
+            self._controller.enrolled_labels = event.enrolled_labels
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -453,12 +871,60 @@ class CrabApp(App[None]):
 
     def add_tool_use(self, label: str) -> None:
         if label.startswith("[DONE]"):
+            self._finalise_assistant_tts()
             self._history.append({"role": "done", "text": label})
         elif self._history and self._history[-1]["role"] == "assistant":
             self._history[-1]["segments"].append(("tool", label))
         else:
             self._history.append({"role": "assistant", "segments": [("tool", label)]})
         self._render_history()
+
+    def _finalise_assistant_tts(self) -> None:
+        """Extract the ``<tts>`` block from the most recent assistant turn and speak it."""
+        for msg in reversed(self._history):
+            if msg["role"] != "assistant":
+                continue
+            if "tts" in msg:
+                return
+            text_chunks = [
+                seg for kind, seg in msg["segments"] if kind == "text"
+            ]
+            if not text_chunks:
+                msg["tts"] = ""
+                return
+            combined = "".join(text_chunks)
+            _, tts_text = _extract_tts(combined)
+            msg["tts"] = tts_text
+            if tts_text:
+                _LOGGER.info("TTS: %s", tts_text)
+                asyncio.create_task(self._speak(tts_text), name="tts")
+            return
+
+    async def _speak(self, text: str) -> None:
+        """Speak *text* using the configured TTS provider, if TTS is enabled."""
+        if not self._tts_enabled:
+            return
+
+        if self._tts_proc is not None:
+            try:
+                self._tts_proc.kill()
+                await self._tts_proc.wait()
+            except Exception:
+                pass
+            self._tts_proc = None
+
+        if self._tts_provider == _TTS_PROVIDER_MACOS:
+            try:
+                self._tts_proc = await asyncio.create_subprocess_exec(
+                    "say", text,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await self._tts_proc.wait()
+            except Exception as exc:
+                _LOGGER.warning("TTS failed: %s", exc)
+            finally:
+                self._tts_proc = None
 
     def add_error_message(self, text: str) -> None:
         self._history.append({"role": "error", "text": text})
@@ -481,7 +947,7 @@ class CrabApp(App[None]):
             return
 
         try:
-            async with AsyncClient(api_key=self._api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
+            async with AsyncClient(api_key=self._api_key, **({'url': self._rt_url} if self._rt_url else {})) as client:
 
                 @client.on(ServerMessageType.RECOGNITION_STARTED)
                 def _on_started(message: dict[str, Any]) -> None:
@@ -559,7 +1025,7 @@ class CrabApp(App[None]):
         finally:
             mic.stop()
 
-        if not self._exiting:
+        if not self._exiting and not self._restarting_sm:
             self.exit()
 
 
