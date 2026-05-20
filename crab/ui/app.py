@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from collections import deque
 from typing import Any
 
@@ -380,7 +381,20 @@ class CrabApp(App[None]):
     # -- Public API (same interface as old UI class) ------------------------
 
     def set_status(self, status: str) -> None:
+        prev = self._status
         self._status = status
+        if status == "listening" and prev == "idle":
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Ping.aiff"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif status == "thinking" and prev == "listening":
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Pop.aiff"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         if status != "listening":
             self.query_one("#cmd-input", Input).placeholder = "Type a command or speak..."
         self._render_visualiser()
