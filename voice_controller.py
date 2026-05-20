@@ -14,21 +14,27 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
-import signal
 from collections import deque
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol
 
 from rich import box as rich_box
 from rich.align import Align
+from rich.console import Console as _RichConsole
 from rich.console import Group
-from rich.layout import Layout
-from rich.live import Live
+from rich.constrain import Constrain
+from rich.markdown import Markdown
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.text import Text
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, VerticalScroll
+from textual.widgets import Input, Static
 
 from speechmatics.rt import (
     AsyncClient,
@@ -103,41 +109,222 @@ _CRAB_ART = _load_crab_art()
 
 
 # ---------------------------------------------------------------------------
+# Chat bubble renderable (60% max width, computed at render time)
+# ---------------------------------------------------------------------------
+
+def _contains_markdown(renderable: Any) -> bool:
+    """Return True if the renderable is or contains a Markdown instance.
+
+    Markdown has no __rich_measure__, so Measurement.get falls back to
+    maximum == options.max_width — useless for sizing. We detect this and
+    fall back to render-based measurement.
+    """
+    if isinstance(renderable, Markdown):
+        return True
+    if isinstance(renderable, Group):
+        return any(_contains_markdown(child) for child in renderable.renderables)
+    return False
+
+
+def _measure_by_render(max_width: int, renderable: Any) -> int:
+    """Return the longest rendered line width by rendering off-screen."""
+    probe = _RichConsole(
+        width=max_width,
+        file=io.StringIO(),
+        force_terminal=False,
+        color_system=None,
+        legacy_windows=False,
+        record=False,
+    )
+    lines = probe.render_lines(renderable, probe.options.update_width(max_width), pad=False)
+    return max((sum(seg.cell_length for seg in line) for line in lines), default=0)
+
+
+class _Bubble:
+    """Panel that grows to fit its content, capped at 60% of console width.
+
+    Uses render-based measurement for Markdown content (which lacks
+    __rich_measure__), and Measurement.get for plain Text and similar.
+    """
+
+    def __init__(
+        self,
+        content: Any,
+        *,
+        align: str = "left",
+        **panel_kw: Any,
+    ) -> None:
+        self._content = content
+        self._align = align
+        self._panel_kw = panel_kw
+
+    def _measure_title(self, console: Any, options: Any) -> int:
+        title = self._panel_kw.get("title")
+        if not title:
+            return 0
+        title_text = console.render_str(title, markup=True) if isinstance(title, str) else title
+        return Measurement.get(console, options, title_text).maximum
+
+    def __rich_console__(self, console: Any, options: Any) -> Any:
+        cap = max(20, int(options.max_width * 0.6))
+        probe_options = options.update_width(cap)
+
+        if _contains_markdown(self._content):
+            natural = _measure_by_render(cap, self._content)
+        else:
+            natural = Measurement.get(console, probe_options, self._content).maximum
+
+        title_width = self._measure_title(console, probe_options)
+        content_width = max(natural, title_width)
+        width = max(20, min(content_width + 4, cap))  # +4: 2 border + 2 padding
+
+        panel = Panel(self._content, expand=False, **self._panel_kw)
+        constrained = Constrain(panel, width=width)
+        if self._align == "right":
+            yield from Align.right(constrained).__rich_console__(console, options)
+        else:
+            yield from constrained.__rich_console__(console, options)
+
+
+# ---------------------------------------------------------------------------
+# UI Protocol
+# ---------------------------------------------------------------------------
+
+class _UI(Protocol):
+    def set_status(self, status: str) -> None: ...
+    def set_partial(self, text: str) -> None: ...
+    def add_user_message(self, text: str) -> None: ...
+    def add_assistant_text(self, text: str) -> None: ...
+    def add_tool_use(self, label: str) -> None: ...
+    def add_error_message(self, text: str) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Settings panel widget
+# ---------------------------------------------------------------------------
+
+class SettingsPanel(Static):
+    """Square panel in the top-right corner. Green normally, orange on hover.
+    Colours and hover are handled entirely by Textual CSS — no Rich re-render."""
+
+    can_focus = False
+
+    def on_mount(self) -> None:
+        self.update("SETTINGS")
+
+    def on_click(self) -> None:
+        pass  # TODO: open settings panel
+
+
+# ---------------------------------------------------------------------------
 # TUI
 # ---------------------------------------------------------------------------
 
-class UI:
-    """Full-screen terminal UI: status bar, conversation history, prompt strip."""
+class CrabApp(App[None]):
+    """Full-screen Textual TUI: visualiser, scrollable conversation, prompt strip."""
 
-    def __init__(self, speaker_name: str = "You") -> None:
+    ENABLE_COMMAND_PALETTE = False
+    BINDINGS = [("ctrl+c", "quit", "Quit"), ("ctrl+q", "quit", "Quit")]
+
+    CSS = """
+    Horizontal#top {
+        height: 9;
+    }
+    Static#visualiser {
+        width: 20;
+        height: 100%;
+    }
+    Static#instructions {
+        width: 1fr;
+        height: 100%;
+    }
+    SettingsPanel {
+        width: 22;
+        height: 100%;
+        background: #29A383;
+        color: white;
+        border: round #29A383;
+        content-align: center middle;
+    }
+    SettingsPanel:hover {
+        background: #F76B15;
+        color: black;
+        border: round #F76B15;
+    }
+    VerticalScroll#conversation {
+        height: 1fr;
+    }
+    Static#history {
+        height: auto;
+    }
+    Input#cmd-input {
+        height: 3;
+        border: round cyan;
+    }
+    Input#cmd-input:focus {
+        border: round cyan;
+    }
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        audio_format: AudioFormat,
+        transcription_config: TranscriptionConfig,
+        speaker_name: str,
+        enrolled_labels: set[str],
+    ) -> None:
+        super().__init__()
+        self._api_key = api_key
+        self._audio_format = audio_format
+        self._transcription_config = transcription_config
         self._speaker_name = speaker_name
+        self._enrolled_labels = enrolled_labels
+
         self._status = "idle"
-        self._last_prompt = ""
         self._partial = ""
+        self._last_prompt = ""
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
         self._frame = 0
-        self._live: Live | None = None
-        self._pulse_task: asyncio.Task[None] | None = None
-        self._layout = self._make_layout()
+        self._stop_event: asyncio.Event | None = None
+        self._sm_task: asyncio.Task[None] | None = None
+        self._controller: VoiceController | None = None
+        self._exiting = False
 
-    # -- Layout --------------------------------------------------------------
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="top"):
+            yield Static(id="visualiser")
+            yield Static(id="instructions")
+            yield SettingsPanel()
+        with VerticalScroll(id="conversation"):
+            yield Static(id="history")
+        yield Input(placeholder="Type a command or speak...", id="cmd-input")
 
-    def _make_layout(self) -> Layout:
-        layout = Layout()
-        layout.split_column(
-            Layout(name="top", size=12),
-            Layout(name="body"),
-            Layout(name="footer", size=3),
-        )
-        layout["top"].split_row(
-            Layout(name="visualiser", size=26),
-            Layout(name="instructions"),
-        )
-        return layout
+    def on_mount(self) -> None:
+        self._stop_event = asyncio.Event()
+        self._render_visualiser()
+        self._render_instructions()
+        self._render_history()
+        self.set_interval(_DOT_INTERVAL, self._tick)
+        self._sm_task = asyncio.create_task(self._run_speechmatics(), name="speechmatics")
 
-    # -- Renderers -----------------------------------------------------------
+    def on_unmount(self) -> None:
+        # Signal the speechmatics task to stop. Do NOT await here — Textual's
+        # shutdown is mid-flight and awaiting causes a race with the event loop
+        # teardown. main() waits for the task after run_async() returns instead.
+        self._exiting = True
+        if self._stop_event is not None:
+            self._stop_event.set()
 
-    def _visualiser_panel(self) -> Panel:
+    # -- Animation tick -----------------------------------------------------
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self._render_visualiser()
+
+    # -- Renderers ----------------------------------------------------------
+
+    def _render_visualiser(self) -> None:
         if self._status == "idle":
             art = _CRAB_ART["idle"]
             label = "Idle"
@@ -151,14 +338,15 @@ class UI:
             label = "Thinking..."
             color = "bright_yellow"
         t = Text(art, style=color, justify="center")
-        return Panel(
+        panel = Panel(
             Align.center(t, vertical="middle"),
             title="[bold]CRAB VISUALISER[/bold]",
             subtitle=f"[{color}]{label}[/{color}]",
             border_style=color,
         )
+        self.query_one("#visualiser", Static).update(panel)
 
-    def _instructions_panel(self) -> Panel:
+    def _render_instructions(self) -> None:
         t = Text(justify="left")
         t.append("How to use\n\n", style="bold")
         t.append("1. ", style="dim"); t.append('Say "CRAB-BOT"\n')
@@ -166,9 +354,14 @@ class UI:
         t.append("3. ", style="dim"); t.append("Pause — end of speech is detected automatically\n")
         t.append("4. ", style="dim"); t.append("Wait for Claude to respond\n")
         t.append("5. ", style="dim"); t.append('Say "CRAB-BOT" again for your next command')
-        return Panel(Align.center(t, vertical="middle"), title="[bold]C.R.A.B — Claude Realtime Audio Bot[/bold]", border_style="dim")
+        panel = Panel(
+            Align.center(t, vertical="middle"),
+            title="[bold]C.R.A.B — Claude Realtime Audio Bot[/bold]",
+            border_style="dim",
+        )
+        self.query_one("#instructions", Static).update(panel)
 
-    def _body_panel(self) -> Panel:
+    def _render_history(self) -> None:
         if not self._history:
             content: Any = Align.center(Text("No conversation yet.", style="dim"))
         else:
@@ -176,88 +369,77 @@ class UI:
             for msg in self._history:
                 role = msg["role"]
                 if role == "user":
-                    items.append(Panel(
+                    items.append(_Bubble(
                         Text(msg["text"]),
+                        align="left",
                         title=f"[bold cyan]{self._speaker_name}[/bold cyan]",
                         box=rich_box.ROUNDED,
                         border_style="cyan",
-                        expand=False,
                     ))
                 elif role == "assistant":
-                    t = Text()
-                    for i, (kind, seg) in enumerate(msg["segments"]):
-                        if i > 0:
-                            t.append("\n")
-                        t.append(seg, style="dim" if kind == "tool" else "")
-                    items.append(Align.right(Panel(
-                        t,
+                    parts: list[Any] = []
+                    text_chunks: list[str] = []
+                    for kind, seg in msg["segments"]:
+                        if kind == "text":
+                            text_chunks.append(seg)
+                        else:
+                            if text_chunks:
+                                parts.append(Markdown("".join(text_chunks)))
+                                text_chunks = []
+                            parts.append(Text(seg, style="dim"))
+                    if text_chunks:
+                        parts.append(Markdown("".join(text_chunks)))
+                    items.append(_Bubble(
+                        Group(*parts) if parts else Text(""),
+                        align="right",
                         title="[dim]CRAB[/dim]",
                         box=rich_box.ROUNDED,
                         border_style="dim",
-                        expand=False,
-                    )))
+                    ))
                 elif role == "done":
                     items.append(Align.right(Text(msg["text"], style="dim")))
                 elif role == "error":
                     items.append(Text(msg["text"], style="bright_red"))
                 items.append(Text(""))
             content = Group(*items)
-        return Panel(content, title="[dim]Conversation[/dim]", border_style="dim")
+        self.query_one("#history", Static).update(content)
+        self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
-    def _footer_panel(self) -> Panel:
-        display = self._partial or self._last_prompt
-        t = Text()
-        t.append(f"{self._speaker_name}  ", style="bold cyan")
-        t.append(display)
-        return Panel(t, box=rich_box.ROUNDED, border_style="cyan")
+    # -- Input / settings event handlers ------------------------------------
 
-    # -- Refresh -------------------------------------------------------------
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        if not text or self._controller is None:
+            return
+        self._controller.last_prompt = text
+        self._controller.state = _State.IDLE
+        self.add_user_message(text)
+        self.set_status("thinking")
+        self._controller.prompt_ready.set()
+        event.input.clear()
 
-    def _refresh(self) -> None:
-        self._layout["visualiser"].update(self._visualiser_panel())
-        self._layout["instructions"].update(self._instructions_panel())
-        self._layout["body"].update(self._body_panel())
-        self._layout["footer"].update(self._footer_panel())
-        if self._live:
-            self._live.refresh()
-
-    async def _pulse(self) -> None:
-        while True:
-            self._frame += 1
-            self._refresh()
-            await asyncio.sleep(_DOT_INTERVAL)
-
-    # -- Lifecycle -----------------------------------------------------------
-
-    def start(self, live: Live) -> None:
-        self._live = live
-        try:
-            self._pulse_task = asyncio.create_task(self._pulse(), name="ui-pulse")
-        except RuntimeError:
-            pass
-
-    def stop(self) -> None:
-        if self._pulse_task and not self._pulse_task.done():
-            self._pulse_task.cancel()
-        self._pulse_task = None
-
-    # -- State mutations -----------------------------------------------------
+    # -- Public API (same interface as old UI class) ------------------------
 
     def set_status(self, status: str) -> None:
         self._status = status
         if status != "listening":
             self._partial = ""
-        self._refresh()
+            self.query_one("#cmd-input", Input).placeholder = "Type a command or speak..."
+        self._render_visualiser()
 
     def set_partial(self, text: str) -> None:
         self._partial = text
-        self._refresh()
+        inp = self.query_one("#cmd-input", Input)
+        if not inp.value:
+            inp.placeholder = text if text else "Type a command or speak..."
 
     def add_user_message(self, text: str) -> None:
         self._last_prompt = text
         self._partial = ""
         self._history.append({"role": "user", "text": text})
-        self._refresh()
+        self._render_history()
+        inp = self.query_one("#cmd-input", Input)
+        inp.placeholder = "Type a command or speak..."
 
     def add_assistant_text(self, text: str) -> None:
         clean = _ANSI_ESCAPE.sub("", text).strip()
@@ -267,7 +449,7 @@ class UI:
             self._history[-1]["segments"].append(("text", clean))
         else:
             self._history.append({"role": "assistant", "segments": [("text", clean)]})
-        self._refresh()
+        self._render_history()
 
     def add_tool_use(self, label: str) -> None:
         if label.startswith("[DONE]"):
@@ -276,11 +458,109 @@ class UI:
             self._history[-1]["segments"].append(("tool", label))
         else:
             self._history.append({"role": "assistant", "segments": [("tool", label)]})
-        self._refresh()
+        self._render_history()
 
     def add_error_message(self, text: str) -> None:
         self._history.append({"role": "error", "text": text})
-        self._refresh()
+        self._render_history()
+
+    # -- Speechmatics integration -------------------------------------------
+
+    async def _run_speechmatics(self) -> None:
+        assert self._stop_event is not None
+        stop_event = self._stop_event
+        controller = VoiceController(enrolled_labels=self._enrolled_labels, ui=self)
+        self._controller = controller
+
+        mic = Microphone(
+            sample_rate=self._audio_format.sample_rate,
+            chunk_size=self._audio_format.chunk_size,
+        )
+        if not mic.start():
+            self.add_error_message("[ERROR] Microphone not available — install with `pip install pyaudio`.")
+            return
+
+        try:
+            async with AsyncClient(api_key=self._api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
+
+                @client.on(ServerMessageType.RECOGNITION_STARTED)
+                def _on_started(message: dict[str, Any]) -> None:
+                    if _DEBUG:
+                        self.add_tool_use("[DBG MSG] RECOGNITION_STARTED")
+                    self.set_status("idle")
+
+                @client.on(ServerMessageType.ADD_TRANSCRIPT)
+                def _on_final(message: dict[str, Any]) -> None:
+                    controller.handle_final(message)
+
+                @client.on(ServerMessageType.END_OF_UTTERANCE)
+                def _on_eou(message: dict[str, Any]) -> None:
+                    controller.handle_end_of_utterance(message)
+
+                @client.on(ServerMessageType.ERROR)
+                def _on_server_error(message: dict[str, Any]) -> None:
+                    if _DEBUG:
+                        self.add_tool_use("[DBG MSG] ERROR")
+                    reason = message.get("reason", "unknown")
+                    self.add_error_message(f"[ERROR] {reason}")
+                    stop_event.set()
+
+                await client.start_session(
+                    transcription_config=self._transcription_config,
+                    audio_format=self._audio_format,
+                )
+
+                if _DEBUG:
+                    self.add_tool_use("[READY] Debug mode ON.")
+
+                pump_task = asyncio.create_task(
+                    _audio_pump(
+                        client=client,
+                        mic=mic,
+                        controller=controller,
+                        chunk_size=self._audio_format.chunk_size,
+                        stop_event=stop_event,
+                    ),
+                    name="audio-pump",
+                )
+                driver_task = asyncio.create_task(
+                    claude_driver(
+                        controller=controller,
+                        ui=self,
+                        stop_event=stop_event,
+                    ),
+                    name="claude-driver",
+                )
+                stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
+
+                try:
+                    await asyncio.wait(
+                        {pump_task, driver_task, stop_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    stop_event.set()
+                    pump_task.cancel()
+                    driver_task.cancel()
+                    stop_task.cancel()
+                    for task in (pump_task, driver_task, stop_task):
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    try:
+                        await asyncio.wait_for(client.stop_session(), timeout=3.0)
+                    except Exception:
+                        pass
+
+        except AuthenticationError as exc:
+            self.add_error_message(f"[ERROR] Authentication failed: {exc}")
+            await asyncio.sleep(2)
+        finally:
+            mic.stop()
+
+        if not self._exiting:
+            self.exit()
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +627,7 @@ class _State(str, Enum):
 class VoiceController:
     """Coordinates microphone capture, ASR events, and prompt assembly."""
 
-    def __init__(self, enrolled_labels: set[str], ui: UI) -> None:
+    def __init__(self, enrolled_labels: set[str], ui: _UI) -> None:
         self._ui = ui
         self.enrolled_labels = enrolled_labels
         self.state: _State = _State.IDLE
@@ -592,7 +872,7 @@ async def _enroll_speaker(api_key: str, audio_format: AudioFormat) -> dict[str, 
 # Claude output rendering + driver
 # ---------------------------------------------------------------------------
 
-def _handle_stream_event(event: dict[str, Any], ui: UI) -> None:
+def _handle_stream_event(event: dict[str, Any], ui: _UI) -> None:
     """Dispatch a claude --output-format stream-json event to the UI."""
     event_type = event.get("type")
 
@@ -642,7 +922,7 @@ def _handle_stream_event(event: dict[str, Any], ui: UI) -> None:
 
 async def claude_driver(
     controller: VoiceController,
-    ui: UI,
+    ui: _UI,
     stop_event: asyncio.Event,
 ) -> None:
     """Run `claude -p` for each assembled prompt, streaming output to the UI.
@@ -735,107 +1015,30 @@ async def main() -> None:
     ]
     enrolled_labels = set(speakers.keys())
     transcription_config = _build_transcription_config(speakers=speaker_identifiers)
-
     speaker_name = next(iter(enrolled_labels), "You")
-    ui = UI(speaker_name=speaker_name)
-    controller = VoiceController(enrolled_labels=enrolled_labels, ui=ui)
-    stop_event = asyncio.Event()
 
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, stop_event.set)
-    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
-
-    mic = Microphone(
-        sample_rate=audio_format.sample_rate,
-        chunk_size=audio_format.chunk_size,
+    app = CrabApp(
+        api_key=api_key,
+        audio_format=audio_format,
+        transcription_config=transcription_config,
+        speaker_name=speaker_name,
+        enrolled_labels=enrolled_labels,
     )
-    if not mic.start():
-        print("PyAudio not available - install with `pip install pyaudio`.")
-        return
+    await app.run_async()
 
-    with Live(ui._layout, screen=True, auto_refresh=False) as live:
-        ui.start(live)
-        if _DEBUG:
-            ui.add_tool_use("[READY] Debug mode ON.")
-
+    # Textual has exited but the asyncio event loop (asyncio.run) is still live.
+    # Wait here for the speechmatics task to finish its own cleanup (stop_session,
+    # mic.stop) before we let asyncio.run() return and Python starts joining threads.
+    sm_task = app._sm_task
+    if sm_task and not sm_task.done():
         try:
-            async with AsyncClient(api_key=api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
-
-                @client.on(ServerMessageType.RECOGNITION_STARTED)
-                def _on_started(message: dict[str, Any]) -> None:
-                    if _DEBUG:
-                        ui.add_tool_use("[DBG MSG] RECOGNITION_STARTED")
-                    ui.set_status("idle")
-
-                @client.on(ServerMessageType.ADD_TRANSCRIPT)
-                def _on_final(message: dict[str, Any]) -> None:
-                    controller.handle_final(message)
-
-                @client.on(ServerMessageType.END_OF_UTTERANCE)
-                def _on_eou(message: dict[str, Any]) -> None:
-                    controller.handle_end_of_utterance(message)
-
-                @client.on(ServerMessageType.ERROR)
-                def _on_server_error(message: dict[str, Any]) -> None:
-                    if _DEBUG:
-                        ui.add_tool_use("[DBG MSG] ERROR")
-                    reason = message.get("reason", "unknown")
-                    ui.add_error_message(f"[ERROR] {reason}")
-                    stop_event.set()
-
-                await client.start_session(
-                    transcription_config=transcription_config,
-                    audio_format=audio_format,
-                )
-
-                pump_task = asyncio.create_task(
-                    _audio_pump(
-                        client=client,
-                        mic=mic,
-                        controller=controller,
-                        chunk_size=audio_format.chunk_size,
-                        stop_event=stop_event,
-                    ),
-                    name="audio-pump",
-                )
-                driver_task = asyncio.create_task(
-                    claude_driver(
-                        controller=controller,
-                        ui=ui,
-                        stop_event=stop_event,
-                    ),
-                    name="claude-driver",
-                )
-                stop_task = asyncio.create_task(stop_event.wait(), name="stop-wait")
-
-                try:
-                    await asyncio.wait(
-                        {pump_task, driver_task, stop_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    stop_event.set()
-                    ui.stop()
-                    pump_task.cancel()
-                    driver_task.cancel()
-                    stop_task.cancel()
-                    for task in (pump_task, driver_task, stop_task):
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                    try:
-                        await asyncio.wait_for(client.stop_session(), timeout=3.0)
-                    except Exception:
-                        pass
-
-        except AuthenticationError as exc:
-            ui.add_error_message(f"[ERROR] Authentication failed: {exc}")
-            await asyncio.sleep(2)
-        finally:
-            mic.stop()
+            await asyncio.wait_for(sm_task, timeout=4.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            sm_task.cancel()
+            try:
+                await sm_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 if __name__ == "__main__":
@@ -843,5 +1046,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    finally:
-        print("\n[BYE] Exiting.")
+    print("\n[BYE] Exiting.")
+    # os._exit skips Python's atexit thread-join phase (concurrent.futures executor
+    # threads from PyAudio / Textual internals) which hangs on a second Ctrl+C.
+    os._exit(0)

@@ -1,4 +1,5 @@
 speechmatics-rt
 pyaudio
 rich
+textual
 typing_extensions
