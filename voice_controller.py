@@ -285,7 +285,7 @@ async def _enroll_speaker_tui(
         raise RuntimeError("Microphone not available")
 
     try:
-        async with AsyncClient(api_key=api_key, **({"url": rt_url} if rt_url else {})) as client:
+        async with AsyncClient(api_key=api_key, url=rt_url) as client:
 
             @client.on(ServerMessageType.SPEAKERS_RESULT)
             def _on_speakers(msg: dict[str, Any]) -> None:
@@ -626,8 +626,6 @@ class CrabApp(App[None]):
         self._enrolled_labels = enrolled_labels
 
         self._status = "idle"
-        self._partial = ""
-        self._last_prompt = ""
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
         self._frame = 0
         self._stop_event: asyncio.Event | None = None
@@ -800,7 +798,9 @@ class CrabApp(App[None]):
                         await self._sm_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
                     pass
             self._controller = None
             self.set_status("idle")
@@ -827,6 +827,22 @@ class CrabApp(App[None]):
                 self._run_speechmatics(), name="speechmatics"
             )
 
+    async def await_asr_shutdown(self, timeout: float = 4.0) -> None:
+        """Wait for the ASR task to finish its own cleanup after Textual has exited."""
+        task = self._sm_task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(task, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception:
+            pass
+
     def on_crab_app_settings_changed(self, event: "CrabApp.SettingsChanged") -> None:
         self._rt_url = event.rt_url
         self._tts_enabled = event.tts_enabled
@@ -851,19 +867,15 @@ class CrabApp(App[None]):
     def set_status(self, status: str) -> None:
         self._status = status
         if status != "listening":
-            self._partial = ""
             self.query_one("#cmd-input", Input).placeholder = "Type a command or speak..."
         self._render_visualiser()
 
     def set_partial(self, text: str) -> None:
-        self._partial = text
         inp = self.query_one("#cmd-input", Input)
         if not inp.value:
             inp.placeholder = text if text else "Type a command or speak..."
 
     def add_user_message(self, text: str) -> None:
-        self._last_prompt = text
-        self._partial = ""
         self._history.append({"role": "user", "text": text})
         self._render_history()
         inp = self.query_one("#cmd-input", Input)
@@ -987,7 +999,7 @@ class CrabApp(App[None]):
             return
 
         try:
-            async with AsyncClient(api_key=self._api_key, **({'url': self._rt_url} if self._rt_url else {})) as client:
+            async with AsyncClient(api_key=self._api_key, url=self._rt_url) as client:
 
                 @client.on(ServerMessageType.RECOGNITION_STARTED)
                 def _on_started(message: dict[str, Any]) -> None:
@@ -1053,11 +1065,11 @@ class CrabApp(App[None]):
                         try:
                             await task
                         except (asyncio.CancelledError, Exception):
-                            pass
+                            pass  # we initiated cancellation — safe to swallow
                     try:
                         await asyncio.wait_for(client.stop_session(), timeout=3.0)
                     except Exception:
-                        pass
+                        _LOGGER.debug("stop_session error (ignored)", exc_info=True)
 
         except AuthenticationError as exc:
             self.add_error_message(f"[ERROR] Authentication failed: {exc}")
@@ -1324,7 +1336,7 @@ async def _enroll_speaker(api_key: str, audio_format: AudioFormat) -> dict[str, 
         raise RuntimeError("Microphone not available for enrollment")
 
     try:
-        async with AsyncClient(api_key=api_key, **({'url': _RT_URL} if _RT_URL else {})) as client:
+        async with AsyncClient(api_key=api_key, url=_RT_URL) as client:
 
             @client.on(ServerMessageType.RECOGNITION_STARTED)
             def _on_started(msg: dict[str, Any]) -> None:
@@ -1535,16 +1547,7 @@ async def main() -> None:
     # Textual has exited but the asyncio event loop (asyncio.run) is still live.
     # Wait here for the speechmatics task to finish its own cleanup (stop_session,
     # mic.stop) before we let asyncio.run() return and Python starts joining threads.
-    sm_task = app._sm_task
-    if sm_task and not sm_task.done():
-        try:
-            await asyncio.wait_for(sm_task, timeout=4.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            sm_task.cancel()
-            try:
-                await sm_task
-            except (asyncio.CancelledError, Exception):
-                pass
+    await app.await_asr_shutdown(timeout=4.0)
 
 
 if __name__ == "__main__":
