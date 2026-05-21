@@ -53,6 +53,7 @@ def _load_crab_art() -> dict[str, Any]:
     except FileNotFoundError:
         pass
     return {
+        "title":     sections.get("title",      "C.R.A.B"),
         "idle":      sections.get("idle",       "彡(-.-)ミ\n  ^   ^"),
         "listening": sections.get("listening",  "彡(ᵔᵕᵔ)ミ\n  ^   ^"),
         "thinking":  [

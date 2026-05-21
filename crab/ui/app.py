@@ -218,14 +218,8 @@ class CrabApp(App[None]):
         self.query_one("#visualiser", Static).update(panel)
 
     def _render_instructions(self) -> None:
-        art = (
-            "  ___    ____      __      ____ \n"
-            " / __)  (  _ \\    /__\\    (  _ \\\n"
-            "( (__    )   /   /(__)\\    ) _ <\n"
-            " \\___)()(_)\\_)()(__)(__)()(____/"
-        )
         t = Text(justify="center")
-        t.append(art, style="bold #29A383")
+        t.append(_CRAB_ART["title"], style="bold #29A383")
         t.append("\n\n--{ via Speechmatics }--", style="dim")
         panel = Panel(
             Align.center(t, vertical="middle"),
