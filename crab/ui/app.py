@@ -212,6 +212,7 @@ class CrabApp(App[None]):
         t = Text(art, style=color, justify="center")
         panel = Panel(
             Align.center(t, vertical="middle"),
+            title="[bold]CRAB VISUALISER[/bold]",
             subtitle=f"[{color}]{label}[/{color}]",
             border_style=color,
         )
