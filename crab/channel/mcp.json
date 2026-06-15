@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crab": {
+      "command": "python3",
+      "args": ["-m", "crab.channel.server"]
+    }
+  }
+}

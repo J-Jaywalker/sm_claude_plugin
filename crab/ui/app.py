@@ -32,6 +32,7 @@ from speechmatics.rt import (
 
 from crab.asr.controller import VoiceController, _State
 from crab.asr.pumps import _audio_pump
+from crab.channel.driver import channel_driver
 from crab.claude.driver import claude_driver
 from crab.config import (
     _ANSI_ESCAPE,
@@ -60,7 +61,11 @@ class CrabApp(App[None]):
     """Full-screen Textual TUI: visualiser, scrollable conversation, prompt strip."""
 
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [("ctrl+c", "quit", "Quit"), ("ctrl+q", "quit", "Quit")]
+    BINDINGS = [
+        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+q", "quit", "Quit"),
+        ("ctrl+t", "toggle_mouse", "Toggle mouse (free text select)"),
+    ]
 
     class SettingsChanged(Message):
         """Posted by SettingsModal when the user saves new settings."""
@@ -132,6 +137,7 @@ class CrabApp(App[None]):
         transcription_config: TranscriptionConfig,
         speaker_name: str,
         enrolled_labels: set[str],
+        use_channels: bool = True,
     ) -> None:
         super().__init__()
         self._api_key = api_key
@@ -139,6 +145,7 @@ class CrabApp(App[None]):
         self._transcription_config = transcription_config
         self._speaker_name = speaker_name
         self._enrolled_labels = enrolled_labels
+        self._use_channels = use_channels
 
         self._status = "idle"
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
@@ -157,6 +164,7 @@ class CrabApp(App[None]):
         self._wake_word_model: str = ""
         self._wake_word_threshold: float = 0.5
         self._narrate_scan_buf: str = ""
+        self._mouse_capture_enabled: bool = True
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -377,6 +385,28 @@ class CrabApp(App[None]):
         if self._controller is not None:
             self._controller.enrolled_labels = event.enrolled_labels
 
+    def action_toggle_mouse(self) -> None:
+        """Toggle Textual's mouse capture so text can be selected natively.
+
+        When OFF: the terminal handles drag-to-select normally, but Textual
+        no longer sees mouse events (settings panel becomes keyboard-only).
+        When ON: Textual receives all mouse events as usual.
+        """
+        driver = self._driver
+        if driver is None:
+            return
+        self._mouse_capture_enabled = not self._mouse_capture_enabled
+        if self._mouse_capture_enabled:
+            driver._enable_mouse_support()
+            self.add_tool_use(
+                "[MOUSE] capture ON — text-select blocked; settings clickable"
+            )
+        else:
+            driver._disable_mouse_support()
+            self.add_tool_use(
+                "[MOUSE] capture OFF — drag to select text freely (Ctrl+T to restore)"
+            )
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         if not text or self._controller is None:
@@ -393,7 +423,9 @@ class CrabApp(App[None]):
     def set_status(self, status: str) -> None:
         prev = self._status
         self._status = status
-        if status == "listening" and prev == "idle":
+        # Chime on any non-listening → listening so both wake-word and
+        # permission-listen transitions get the same audible cue.
+        if status == "listening" and prev != "listening":
             subprocess.Popen(
                 ["afplay", "/System/Library/Sounds/Ping.aiff"],
                 stdout=subprocess.DEVNULL,
@@ -470,6 +502,16 @@ class CrabApp(App[None]):
             self._history.append({"role": "assistant", "segments": [("tool", label)]})
         self._render_history()
 
+    def finalise_assistant_turn(self) -> None:
+        """Public hook: speak the `<tts>` block of the latest assistant turn.
+
+        Channel-mode drivers call this once Claude has finished replying for
+        the turn (legacy stream-json mode triggers it via the `[DONE]` tool
+        use). Safe to call multiple times — already-finalised turns are
+        skipped.
+        """
+        self._finalise_assistant_tts()
+
     def _finalise_assistant_tts(self) -> None:
         """Extract the ``<tts>`` block from the most recent assistant turn and speak it."""
         for msg in reversed(self._history):
@@ -490,6 +532,22 @@ class CrabApp(App[None]):
                 _LOGGER.info("TTS: %s", tts_text)
                 asyncio.create_task(self._speak(tts_text), name="tts")
             return
+
+    def speak(self, text: str) -> None:
+        """Fire-and-forget TTS. Returns immediately; speech happens asynchronously."""
+        if not self._tts_enabled or not text.strip():
+            return
+        asyncio.create_task(self._speak(text), name="tts-speak")
+
+    async def speak_and_wait(self, text: str) -> None:
+        """Speak `text` and block until TTS playback finishes.
+
+        Used by the channel driver before opening the mic for a permission
+        answer — we don't want Speechmatics capturing our own TTS audio.
+        """
+        if not text.strip():
+            return
+        await self._speak(text)
 
     async def _speak(self, text: str) -> None:
         """Speak *text* using the configured TTS provider, if TTS is enabled."""
@@ -628,13 +686,14 @@ class CrabApp(App[None]):
                     ),
                     name="audio-pump",
                 )
+                driver_fn = channel_driver if self._use_channels else claude_driver
                 driver_task = asyncio.create_task(
-                    claude_driver(
+                    driver_fn(
                         controller=controller,
                         ui=self,
                         stop_event=stop_event,
                     ),
-                    name="claude-driver",
+                    name="channel-driver" if self._use_channels else "claude-driver",
                 )
 
                 if one_shot and session_stop is not None:
