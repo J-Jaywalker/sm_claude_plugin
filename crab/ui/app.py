@@ -466,23 +466,33 @@ class CrabApp(App[None]):
     def set_status(self, status: str) -> None:
         prev = self._status
         self._status = status
-        # Chime on any non-listening → listening so both wake-word and
-        # permission-listen transitions get the same audible cue.
+        # Audible cues for visualiser state transitions:
+        #   Ping (any → listening): the mic just opened — wake-word fired,
+        #                           permission ask, or menu prompt.
+        #   Pop  (listening → thinking, OR thinking → idle): a transient
+        #                           "done with this stage" cue. Fires both
+        #                           when the user finishes speaking and when
+        #                           Claude finishes replying.
         if status == "listening" and prev != "listening":
-            subprocess.Popen(
-                ["afplay", "/System/Library/Sounds/Ping.aiff"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif status == "thinking" and prev == "listening":
-            subprocess.Popen(
-                ["afplay", "/System/Library/Sounds/Pop.aiff"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            self._chime("Ping")
+        elif (status == "thinking" and prev == "listening") or (
+            status == "idle" and prev == "thinking"
+        ):
+            self._chime("Pop")
         if status != "listening":
             self.query_one("#cmd-input", Input).placeholder = "Type a command or speak..."
         self._render_visualiser()
+
+    def _chime(self, name: str) -> None:
+        """Fire-and-forget macOS afplay for a short system sound."""
+        try:
+            subprocess.Popen(
+                ["afplay", f"/System/Library/Sounds/{name}.aiff"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def set_partial(self, text: str) -> None:
         inp = self.query_one("#cmd-input", Input)
