@@ -144,7 +144,17 @@ async def channel_driver(
             connection_future, timeout=60.0
         )
     except asyncio.TimeoutError:
-        ui.add_error_message("[CHANNEL] MCP child never connected — see /tmp/crab-claude.pty.log")
+        # Claude either failed to start at all, never spawned our MCP child,
+        # or the child crashed before sending its handshake.
+        if proc.returncode is not None:
+            cause = f"Claude exited (rc={proc.returncode}) before the MCP child connected"
+        else:
+            cause = "Claude is still running but never spawned the MCP child"
+        ui.add_error_message(
+            f"[CHANNEL] timed out after 60s — {cause}. "
+            f"Check /tmp/crab-claude.pty.log for Claude's UI output (and "
+            f"/tmp/crab-channel-debug.log if DEBUG=1)."
+        )
         await _teardown(proc, master_fd, sock_server, pty_log_file, tasks, None)
         return
 
@@ -203,7 +213,10 @@ async def channel_driver(
                     ui.speak(text)
                 else:  # assistant
                     ui.add_assistant_text(text)
-                    ui.finalise_assistant_turn()
+                    # Await the <tts> clip (which queues behind any narrate
+                    # still playing) so the mic doesn't reopen while we're
+                    # still speaking.
+                    await ui.finalise_assistant_turn()
                     ui.set_status("idle")
                     controller.listening.set()
                     controller.response_done.set()

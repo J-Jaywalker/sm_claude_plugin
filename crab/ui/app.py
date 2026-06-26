@@ -162,6 +162,13 @@ class CrabApp(App[None]):
         self._wake_word_threshold: float = 0.5
         self._narrate_scan_buf: str = ""
         self._mouse_capture_enabled: bool = True
+        # TTS playback is serialized through this queue so concurrent narrate /
+        # <tts> / menu-question requests never interrupt each other. Items are
+        # (text, optional Future that resolves once that clip finishes).
+        self._tts_queue: asyncio.Queue[
+            tuple[str, asyncio.Future[None] | None] | None
+        ] = asyncio.Queue()
+        self._tts_worker_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -179,6 +186,7 @@ class CrabApp(App[None]):
         self._render_history()
         self.set_interval(_DOT_INTERVAL, self._tick)
         self._sm_task = asyncio.create_task(self._run_speechmatics(), name="speechmatics")
+        self._tts_worker_task = asyncio.create_task(self._tts_worker(), name="tts-worker")
 
     def on_unmount(self) -> None:
         # Signal the speechmatics task to stop. Do NOT await here — Textual's
@@ -187,6 +195,14 @@ class CrabApp(App[None]):
         self._exiting = True
         if self._stop_event is not None:
             self._stop_event.set()
+        # Tell the TTS worker to exit cleanly. Kill any in-flight clip so the
+        # event loop teardown doesn't block on a long `say` invocation.
+        try:
+            self._tts_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._tts_worker_task is not None and not self._tts_worker_task.done():
+            self._tts_worker_task.cancel()
         if self._tts_proc is not None:
             try:
                 self._tts_proc.kill()
@@ -508,9 +524,7 @@ class CrabApp(App[None]):
         for m in matches:
             narrate_text = m.group(1).strip()
             if narrate_text:
-                asyncio.create_task(
-                    self._speak(narrate_text), name="tts-narrate"
-                )
+                self._enqueue_tts(narrate_text, wait=False)
         if matches:
             self._narrate_scan_buf = self._narrate_scan_buf[matches[-1].end():]
         elif (
@@ -529,66 +543,110 @@ class CrabApp(App[None]):
             self._history.append({"role": "assistant", "segments": [("tool", label)]})
         self._render_history()
 
-    def finalise_assistant_turn(self) -> None:
-        """Public hook: speak the `<tts>` block of the latest assistant turn.
+    async def finalise_assistant_turn(self) -> None:
+        """Queue the `<tts>` block of the latest assistant turn AND wait for it.
 
-        Channel-mode drivers call this once Claude has finished replying for
-        the turn (legacy stream-json mode triggers it via the `[DONE]` tool
-        use). Safe to call multiple times — already-finalised turns are
-        skipped.
+        Awaits whatever is currently playing PLUS this clip — guarantees that
+        the next listening cycle doesn't open the mic while we're still
+        speaking. Safe to call multiple times on the same turn (no-op after
+        the first; the turn is marked as finalised).
         """
-        self._finalise_assistant_tts()
+        fut = self._finalise_assistant_tts()
+        if fut is not None:
+            try:
+                await fut
+            except asyncio.CancelledError:
+                raise
 
-    def _finalise_assistant_tts(self) -> None:
-        """Extract the ``<tts>`` block from the most recent assistant turn and speak it."""
+    def _finalise_assistant_tts(self) -> asyncio.Future[None] | None:
+        """Extract the ``<tts>`` block from the most recent assistant turn
+        and queue it for playback.
+
+        Returns a Future that resolves once the clip finishes playing, or
+        ``None`` if the turn has nothing to say (or was already finalised).
+        """
         for msg in reversed(self._history):
             if msg["role"] != "assistant":
                 continue
             if "tts" in msg:
-                return
+                return None
             text_chunks = [
                 seg for kind, seg in msg["segments"] if kind == "text"
             ]
             if not text_chunks:
                 msg["tts"] = ""
-                return
+                return None
             combined = _NARRATE_TAG_RE.sub("", "".join(text_chunks))
             _, tts_text = _extract_tts(combined)
             msg["tts"] = tts_text
             if tts_text:
                 _LOGGER.info("TTS: %s", tts_text)
-                asyncio.create_task(self._speak(tts_text), name="tts")
-            return
+                return self._enqueue_tts(tts_text, wait=True)
+            return None
+        return None
 
     def speak(self, text: str) -> None:
-        """Fire-and-forget TTS. Returns immediately; speech happens asynchronously."""
-        if not self._tts_enabled or not text.strip():
-            return
-        asyncio.create_task(self._speak(text), name="tts-speak")
-
-    async def speak_and_wait(self, text: str) -> None:
-        """Speak `text` and block until TTS playback finishes.
-
-        Used by the channel driver before opening the mic for a permission
-        answer — we don't want Speechmatics capturing our own TTS audio.
-        """
+        """Fire-and-forget TTS. Queued; never interrupts whatever is playing."""
         if not text.strip():
             return
-        await self._speak(text)
+        self._enqueue_tts(text, wait=False)
 
-    async def _speak(self, text: str) -> None:
-        """Speak *text* using the configured TTS provider, if TTS is enabled."""
-        if not self._tts_enabled:
+    async def speak_and_wait(self, text: str) -> None:
+        """Queue `text` and block until it finishes playing (after anything ahead)."""
+        if not text.strip():
             return
-
-        if self._tts_proc is not None:
+        fut = self._enqueue_tts(text, wait=True)
+        if fut is not None:
             try:
-                self._tts_proc.kill()
-                await self._tts_proc.wait()
-            except Exception:
-                pass
-            self._tts_proc = None
+                await fut
+            except asyncio.CancelledError:
+                raise
 
+    def _enqueue_tts(
+        self, text: str, *, wait: bool
+    ) -> asyncio.Future[None] | None:
+        """Append a clip to the TTS playback queue.
+
+        Returns a Future that resolves when *this clip* finishes (only when
+        `wait=True`). Callers passing wait=False get None and rely on the
+        queue's FIFO ordering for correctness.
+        """
+        fut: asyncio.Future[None] | None = None
+        if wait:
+            fut = asyncio.get_event_loop().create_future()
+        try:
+            self._tts_queue.put_nowait((text, fut))
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("TTS enqueue failed: %s", exc)
+            if fut is not None and not fut.done():
+                fut.set_result(None)
+        return fut
+
+    async def _tts_worker(self) -> None:
+        """Single consumer that plays queued clips one at a time."""
+        while True:
+            try:
+                item = await self._tts_queue.get()
+            except asyncio.CancelledError:
+                return
+            if item is None:
+                return
+            text, fut = item
+            try:
+                if self._tts_enabled:
+                    await self._speak_one(text)
+            except asyncio.CancelledError:
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
+                return
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("TTS error: %s", exc)
+            finally:
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
+
+    async def _speak_one(self, text: str) -> None:
+        """Play a single TTS clip via the configured provider."""
         if self._tts_provider == _TTS_PROVIDER_MACOS:
             try:
                 self._tts_proc = await asyncio.create_subprocess_exec(
@@ -597,7 +655,7 @@ class CrabApp(App[None]):
                     stderr=asyncio.subprocess.DEVNULL,
                 )
                 await self._tts_proc.wait()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("TTS failed: %s", exc)
             finally:
                 self._tts_proc = None

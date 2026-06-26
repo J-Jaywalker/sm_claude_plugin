@@ -93,12 +93,31 @@ async def serve_parent(
 ) -> asyncio.AbstractServer:
     """Parent-side: start a Unix socket server.
 
-    `handler(reader, writer)` is awaited once per inbound connection. Removes any
-    stale socket file before binding. Caller is responsible for `await server.serve_forever()`
-    or otherwise holding a reference to the returned Server.
+    `handler(reader, writer)` is awaited once per inbound connection. Removes
+    stale socket files; if a *live* listener is detected on the path, raises
+    rather than silently shadowing it (which would leave the user wondering
+    why the MCP child never connected).
     """
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
+    if path.exists():
+        # Probe — is anyone actually listening on this socket?
+        try:
+            _r, w = await asyncio.open_unix_connection(str(path))
+        except (FileNotFoundError, ConnectionRefusedError):
+            # Stale file from a previous crash — safe to remove.
+            pass
+        else:
+            try:
+                w.close()
+                await w.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(
+                f"another process is already listening on {path}. Kill the "
+                f"stale voice_controller (or its MCP child) before retrying. "
+                f"Try: lsof {path}  (and `kill -9 <pid>`)"
+            )
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
     return await asyncio.start_unix_server(handler, path=str(path))
