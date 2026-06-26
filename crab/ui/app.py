@@ -19,7 +19,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
-from textual.widgets import Input, Static
+from textual.widgets import Footer, Input, Static
 
 from speechmatics.rt import (
     AsyncClient,
@@ -63,7 +63,8 @@ class CrabApp(App[None]):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+q", "quit", "Quit"),
-        ("ctrl+t", "toggle_mouse", "Toggle mouse (free text select)"),
+        ("ctrl+t", "toggle_mouse", "Mouse on (for clicks)"),
+        ("ctrl+s", "open_settings", "Settings"),
     ]
 
     class SettingsChanged(Message):
@@ -161,7 +162,10 @@ class CrabApp(App[None]):
         self._wake_word_model: str = ""
         self._wake_word_threshold: float = 0.5
         self._narrate_scan_buf: str = ""
-        self._mouse_capture_enabled: bool = True
+        # Default OFF so drag-to-select works like a normal terminal. The
+        # user can press Ctrl+T to opt in when they want to click (e.g. the
+        # settings panel), and Ctrl+S opens settings via keyboard regardless.
+        self._mouse_capture_enabled: bool = False
         # TTS playback is serialized through this queue so concurrent narrate /
         # <tts> / menu-question requests never interrupt each other. Items are
         # (text, optional Future that resolves once that clip finishes).
@@ -178,6 +182,9 @@ class CrabApp(App[None]):
         with VerticalScroll(id="conversation"):
             yield Static(id="history")
         yield Input(placeholder="Type a command or speak...", id="cmd-input")
+        # Footer auto-renders the BINDINGS list at the bottom so Ctrl+T
+        # (toggle mouse capture for native text-select) is always visible.
+        yield Footer()
 
     def on_mount(self) -> None:
         self._stop_event = asyncio.Event()
@@ -187,6 +194,14 @@ class CrabApp(App[None]):
         self.set_interval(_DOT_INTERVAL, self._tick)
         self._sm_task = asyncio.create_task(self._run_speechmatics(), name="speechmatics")
         self._tts_worker_task = asyncio.create_task(self._tts_worker(), name="tts-worker")
+        # Mouse capture starts disabled — Textual's driver enables it during
+        # startup, so we explicitly turn it back off now. Users opt in via
+        # Ctrl+T when they want to click (e.g. settings panel).
+        if not self._mouse_capture_enabled and self._driver is not None:
+            try:
+                self._driver._disable_mouse_support()
+            except Exception:  # noqa: BLE001
+                pass
 
     def on_unmount(self) -> None:
         # Signal the speechmatics task to stop. Do NOT await here — Textual's
@@ -397,6 +412,10 @@ class CrabApp(App[None]):
         self._wake_word_threshold = event.wake_word_threshold
         if self._controller is not None:
             self._controller.enrolled_labels = event.enrolled_labels
+
+    def action_open_settings(self) -> None:
+        """Keyboard equivalent of clicking the SettingsPanel widget."""
+        self.post_message(SettingsPanel.OpenSettings())
 
     async def show_menu(
         self,
