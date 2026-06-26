@@ -19,15 +19,6 @@ _ENROLLMENT_SECONDS = 30
 
 _RT_URL = "ws://127.0.0.1:9002/v2" if os.environ.get("SM_LOCAL_CLAUDE_TRANSCRIPTION") else None
 
-_SYSTEM_PROMPT_FILE = os.path.join(os.path.dirname(__file__), "..", "assets", "system_prompt.md")
-
-def _load_system_prompt() -> str:
-    try:
-        with open(_SYSTEM_PROMPT_FILE) as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return ""
-
 _DOT_INTERVAL = 0.2
 
 _CRAB_ART_FILE = os.path.join(os.path.dirname(__file__), "..", "assets", "crab_art.txt")
