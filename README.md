@@ -9,24 +9,48 @@
 --{ via Speechmatics }--
 ```
 
-A voice-controlled interface for [Claude Code](https://claude.ai/code), powered by [Speechmatics](https://speechmatics.com) Realtime ASR. Say **"CRAB-BOT"** to wake it, speak your command, pause — and Claude responds.
+A hands-free voice interface for [Claude Code](https://claude.ai/code), powered by [Speechmatics](https://speechmatics.com) Realtime ASR. Say **"CRAB-BOT"** to wake it, speak your command, pause — Claude responds in your headphones and a Textual chat UI.
+
+When Claude wants to edit a file, run a command, or take any action that needs permission, it speaks the question aloud — you answer **"yes"** or **"no"** by voice. When a decision genuinely needs a multi-choice menu, a small click-to-select modal appears. Read-only tools (Read / Glob / Grep) flow through without a prompt.
+
+## Architecture at a glance
+
+```
+voice_controller.py  ◄── single user-facing surface
+├── Textual TUI (crab visualiser, chat bubbles, settings, menu modal)
+├── Speechmatics RT ASR (mic, wake word, end-of-utterance)
+├── TTS (macOS `say`) + voice permission listener
+└── Unix socket  /tmp/crab-bot.sock
+       │
+       ▼
+crab.channel.server   ◄── spawned by Claude as its MCP stdio child
+hand-rolled JSON-RPC; declares experimental.claude/channel + .../permission
+       │
+       ▼ stdio (MCP)
+Claude Code (hidden PTY)  ◄── launched with
+                              --dangerously-load-development-channels server:crab
+```
+
+There is **no terminal interaction with Claude** — every prompt arrives over the channel, every response comes back through the channel's `reply` tool, and every permission request is relayed to your voice.
 
 ## Features
 
-- **Voice-to-Claude** — streams microphone audio to Speechmatics RT, assembles prompts on end-of-utterance, and submits them to `claude -p`
-- **Full TUI** — Textual-based interface with live visualiser, scrollable conversation history, and a typed-command fallback
-- **Speaker enrollment** — enrols your voice on first run; ignores unrecognised speakers when enrolled
-- **Text-to-speech** — Claude's responses are read back using macOS `say`
-- **Local wake word** — optionally use an OpenWakeWord ONNX model to avoid streaming silence to Speechmatics
-- **Settings panel** — configure endpoint, audio device, TTS, wake word, and enrolled speakers at runtime
+- **Voice-to-Claude** — Speechmatics RT streams, wake word + end-of-utterance, prompts pushed to Claude over a custom MCP channel
+- **Long-running session** — one interactive Claude Code instance for the whole run (no per-turn subprocess)
+- **Voice permission relay** — Edit / Write / Bash and other approval-required tools are read out aloud and gated by voice yes/no
+- **Click-to-select menu fallback** — Claude calls `ask_menu` when a choice can't be reduced to yes/no; a Textual modal pops up
+- **Speaker enrollment** — first-run voice capture; transcripts from unrecognised speakers are ignored
+- **TTS summary** — Claude's `<tts>` block is spoken by macOS `say` at end of turn
+- **Local wake word** — optional offline ONNX model avoids streaming silence to the cloud
+- **`Ctrl+T`** — toggles Textual's mouse capture so you can drag-to-select text natively
 
 ## Requirements
 
 - Python 3.11+
-- macOS (TTS uses `say`; Linux/Windows users can disable TTS in settings)
+- macOS (uses `say` for TTS; Linux/Windows can disable TTS in settings)
+- **Claude Code ≥ 2.1.80** with channels available (`claude --version`)
 - A [Speechmatics API key](https://portal.speechmatics.com)
-- Claude Code installed and authenticated (`claude` on your PATH)
-- `pyaudio` system dependency — on macOS: `brew install portaudio`
+- portaudio (for `pyaudio`): `brew install portaudio`
 
 ## Setup
 
@@ -43,38 +67,38 @@ export SPEECHMATICS_API_KEY=<your-key>
 python voice_controller.py
 ```
 
-On first launch, CRAB-BOT will run a 30-second speaker enrollment session to capture your voice for speaker identification. Speak naturally into your microphone. Enrollment data is saved to `speakers.txt` and reused on subsequent runs.
+On first launch, CRAB-BOT runs a 30-second speaker enrollment so it can ignore transcripts from other voices later. The result is saved to `speakers.txt`.
 
-Set `DEBUG=1` to show raw ASR events in the UI.
+Set `DEBUG=1` to write a diagnostic log to `/tmp/crab-channel-debug.log` (events from the voice controller, channel driver, and MCP server, tagged with their source).
 
 ## How to use
 
-1. Wait for the visualiser to show **Idle**
-2. Say **"CRAB-BOT"** — the visualiser switches to **Listening** (you'll hear a ping)
-3. Speak your command naturally
-4. Pause — end-of-utterance is detected automatically (you'll hear a pop)
-5. Wait for Claude to respond; the full exchange appears in the conversation panel
-6. Say **"CRAB-BOT"** again for your next command
+1. Wait for the visualiser to show **Idle** (red crab).
+2. Say **"CRAB-BOT"** — visualiser flips to **Listening** (green crab) and you hear a Ping.
+3. Speak your command naturally — *"edit auth.py to use bcrypt"*, *"run the tests"*, *"what's in the README"*.
+4. Pause — end-of-utterance fires (Pop sound). The visualiser shows **Thinking**.
+5. If Claude wants to do something that needs permission, you hear **"Allow Write?"** (or Edit / Bash / etc.). Visualiser flips back to **Listening** and you hear another Ping — say **"yes please"** or **"no"**.
+6. Claude finishes the work and the answer appears in the chat. The summary (the `<tts>` block) plays through your speakers.
 
-You can also type commands directly into the input bar at the bottom.
+You can also type into the input bar at the bottom if voice isn't an option.
 
 ## Settings
 
-Press the **Settings** button (top-right) to open the settings panel. Changes take effect immediately after saving; the ASR session is restarted automatically.
+Press the **Settings** button (top-right) to open the panel. Changes take effect immediately — the ASR session restarts automatically.
 
 | Setting | Description |
 |---|---|
-| Transcription Endpoint | Custom Speechmatics RT URL (leave blank for cloud default) |
-| Audio Input Device | Select microphone; a live level meter confirms audio is being captured |
+| Transcription Endpoint | Custom Speechmatics RT URL (blank = cloud default) |
+| Audio Input Device | Microphone selector with live level meter |
 | Enrolled Speakers | Add or remove speaker enrollments |
-| Text-to-Speech | Enable/disable and choose provider |
-| Local Wake Word | Use an ONNX model for offline wake detection (see below) |
+| Text-to-Speech | Enable / disable and pick provider |
+| Local Wake Word | Use an ONNX model for offline wake detection |
 
 ESC saves and closes settings. The Cancel button discards changes.
 
 ## Local wake word
 
-By default, CRAB-BOT streams audio continuously to Speechmatics and uses the transcript to detect the wake phrase. The **local wake word** option runs an offline ONNX model instead, only connecting to Speechmatics once the wake word fires — saving API cost.
+By default CRAB-BOT streams audio continuously to Speechmatics and uses the cloud transcript to detect the wake phrase. The **local wake word** option runs an offline ONNX model first — Speechmatics is only opened once the wake word fires, saving API cost.
 
 Built-in models (no training required):
 
@@ -99,7 +123,7 @@ git clone https://github.com/dscripka/openWakeWord
 
 **2. Generate positive samples**
 
-Use TTS to synthesise ~500+ variations of "crab-bot" across different voices and speeds:
+Use TTS to synthesise ~500+ variations of "crab-bot" across voices and speeds:
 
 ```python
 import asyncio, edge_tts, os
@@ -125,7 +149,7 @@ asyncio.run(generate())
 
 **3. Gather negative samples**
 
-Download a sample of [Mozilla Common Voice](https://commonvoice.mozilla.org/en/datasets) English clips and background noise (e.g. FSD50K) as negatives. Normalise all audio to 16kHz mono:
+Download a sample of [Mozilla Common Voice](https://commonvoice.mozilla.org/en/datasets) English clips and background noise (e.g. FSD50K) as negatives. Normalise everything to 16 kHz mono:
 
 ```bash
 for f in positive_samples/*.wav negative_samples/*.wav; do
@@ -145,30 +169,35 @@ Copy the exported `crab_bot_v0.1.onnx` into the `assets/` folder, then set the *
 
 | File | Purpose |
 |---|---|
-| `assets/crab_art.txt` | ASCII art for the visualiser (idle, listening, thinking) and the title panel |
-| `assets/system_prompt.md` | System prompt prepended to every Claude session |
+| `CLAUDE.md` | CRAB-BOT persona + voice-first response rules + `<tts>` / `ask_menu` conventions. Loaded by Claude on every session start. |
+| `assets/crab_art.txt` | ASCII art for the visualiser (idle / listening / thinking) and the title panel. |
 
 ## Project structure
 
 ```
 crab/
   asr/
-    controller.py     # wake word state machine, prompt assembly
-    devices.py        # lists available audio input devices
+    controller.py     # wake-word state machine, prompt assembly, permission-listen mode
+    devices.py
     enrollment.py     # 30-second speaker enrollment flow
-    pumps.py          # async audio pump to Speechmatics
-    wake_word.py      # OpenWakeWord detector
-  claude/
-    driver.py         # spawns `claude -p`, streams JSON output
-    stream.py         # parses claude stream-json events
+    pumps.py
+    wake_word.py      # OpenWakeWord ONNX detector (optional)
+  channel/
+    bridge.py         # Unix-socket protocol (parent ↔ MCP child)
+    driver.py         # hidden-PTY Claude + socket pumps + permission relay
+    mcp.json          # registers crab.channel.server as the channel for Claude
+    server.py         # hand-rolled JSON-RPC MCP server; reply + ask_menu tools
+    yes_no.py         # voice yes/no parser
   tts/
-    macos.py          # macOS `say` TTS provider
+    macos.py          # macOS `say` provider
   ui/
-    app.py            # Textual TUI app
-    modals.py         # settings and enrollment modal screens
-    rendering.py      # rich chat bubble renderer
-    widgets.py        # settings panel widget
-  config.py           # constants, asset loaders, regex patterns
-  speaker_store.py    # load/save speakers.txt
+    app.py            # Textual CrabApp
+    modals.py         # settings, enrollment, ask_menu modals
+    protocol.py       # _UI Protocol
+    rendering.py      # rich chat-bubble renderer
+    widgets.py        # SettingsPanel widget
+  config.py
+  speaker_store.py
+CLAUDE.md             # project-level Claude persona / format / channel-trust rules
 voice_controller.py   # entry point
 ```

@@ -1,5 +1,7 @@
 # Project Dependencies
 
+## Python packages (`requirements.txt`)
+
 | Package | Version Pin | Category | Purpose |
 |---|---|---|---|
 | `speechmatics-rt` | latest | Core / ASR | Speechmatics real-time speech recognition SDK. Streams audio to the Speechmatics API and returns live transcription results. The heart of the voice input pipeline. |
@@ -8,3 +10,16 @@
 | `textual` | latest | Terminal UI | Full TUI (Text User Interface) framework built on top of Rich. Provides the widget system, layout engine, and event loop that powers the interactive terminal chat interface. |
 | `typing_extensions` | latest | Utility | Backport of newer Python `typing` features (e.g. `Self`, `TypeAlias`, `override`) for compatibility with Python versions that don't yet ship them in stdlib. |
 | `openwakeword` | latest | Wake Word | Open-source wake-word / keyword detection. Listens passively to the microphone and triggers the active recording session when the configured wake phrase is detected. |
+
+The `crab.channel.server` MCP server is a **hand-rolled JSON-RPC stdio loop**
+— it intentionally uses only the standard library so there is no Python-side
+dependency on the official `mcp` SDK.
+
+## External runtime requirements
+
+| Requirement | Minimum | Why |
+|---|---|---|
+| Claude Code CLI (`claude`) | **2.1.80** | The channels research-preview feature; we invoke it via `--dangerously-load-development-channels server:crab`. Earlier versions reject the flag. |
+| macOS `say` command | bundled | Text-to-speech for Claude's `<tts>` summaries and the voice permission prompt. Configurable in settings. |
+| portaudio (system library) | latest | Required by `pyaudio` for microphone capture. On macOS: `brew install portaudio`. |
+| Unix domain sockets | n/a | The bridge between `voice_controller.py` (parent) and `crab.channel.server` (Claude's MCP child) uses `/tmp/crab-bot.sock`. macOS and Linux only. |
