@@ -19,6 +19,9 @@ Wire format (one JSON object per line, UTF-8, terminated with \\n):
                                    "description": str, "input_preview": str}
     {"type": "menu_request",       "request_id": str, "question": str,
                                    "options": [str]}
+    {"type": "notify_action",      "action_type": str, "target": str,
+                                   "summary": str}
+    {"type": "status_update",      "label": str}
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ READY = "ready"
 REPLY = "reply"
 PERMISSION_REQUEST = "permission_request"
 MENU_REQUEST = "menu_request"
+NOTIFY_ACTION = "notify_action"
+STATUS_UPDATE = "status_update"
 
 
 async def send_message(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:

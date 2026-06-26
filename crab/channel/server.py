@@ -103,6 +103,60 @@ _ASK_MENU_TOOL: dict[str, Any] = {
     },
 }
 
+_NOTIFY_ACTION_TOOL: dict[str, Any] = {
+    "name": "notify_action",
+    "description": (
+        "Announce a meaningful tool action BEFORE performing it. Renders as a "
+        "structured tool-use segment in the chat bubble (typed by action_type "
+        "for cleaner display than reply(kind='tool_use')). Use this for Edit, "
+        "Write, Bash, and other approval-required tools — skip for cheap reads "
+        "(Read/Glob/Grep). Examples: "
+        "notify_action(action_type='edit', target='auth.py', summary='use bcrypt'); "
+        "notify_action(action_type='bash', target='pytest tests/test_voice.py')."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action_type": {
+                "type": "string",
+                "enum": ["edit", "write", "read", "bash", "search", "delete", "other"],
+                "description": "Category of the action",
+            },
+            "target": {
+                "type": "string",
+                "description": "What's being acted on (file path, command, search term)",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Optional one-phrase intent (omit for terse output)",
+            },
+        },
+        "required": ["action_type", "target"],
+    },
+}
+
+_SET_STATUS_TOOL: dict[str, Any] = {
+    "name": "set_status",
+    "description": (
+        "Update the crab visualiser's status label to reflect what you're "
+        "currently doing — replaces the default random crab puns ('Snipping...', "
+        "'Pondering...') with a short descriptive phrase. Useful during longer "
+        "operations so the user knows what's happening. Pass label='' to revert "
+        "to the default puns. The state machine (idle/listening/thinking) is "
+        "system-controlled; this only flavours the label below the crab."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "label": {
+                "type": "string",
+                "description": "Short status phrase, or empty string to revert",
+            },
+        },
+        "required": ["label"],
+    },
+}
+
 # Pending ask_menu calls: request_id → Future that resolves with the selected int.
 _pending_menus: dict[str, asyncio.Future[int]] = {}
 
@@ -180,7 +234,14 @@ async def _claude_inbound_loop(sock_writer: asyncio.StreamWriter) -> None:
             await _send_jsonrpc({
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": [_REPLY_TOOL, _ASK_MENU_TOOL]},
+                "result": {
+                    "tools": [
+                        _REPLY_TOOL,
+                        _ASK_MENU_TOOL,
+                        _NOTIFY_ACTION_TOOL,
+                        _SET_STATUS_TOOL,
+                    ],
+                },
             })
         elif method == "tools/call":
             await _handle_tool_call(msg_id, params, sock_writer)
@@ -225,6 +286,32 @@ async def _handle_tool_call(
         })
     elif name == "ask_menu":
         await _handle_ask_menu(msg_id, args, sock_writer)
+    elif name == "notify_action":
+        n = next(_tool_counter)
+        _dlog(f"tool_call #{n} notify_action {args!r}")
+        await bridge.send_message(sock_writer, {
+            "type": bridge.NOTIFY_ACTION,
+            "action_type": (args.get("action_type") or "other").lower(),
+            "target": args.get("target") or "",
+            "summary": args.get("summary") or "",
+        })
+        await _send_jsonrpc({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        })
+    elif name == "set_status":
+        n = next(_tool_counter)
+        _dlog(f"tool_call #{n} set_status label={args.get('label')!r}")
+        await bridge.send_message(sock_writer, {
+            "type": bridge.STATUS_UPDATE,
+            "label": args.get("label") or "",
+        })
+        await _send_jsonrpc({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        })
     else:
         await _send_jsonrpc({
             "jsonrpc": "2.0",

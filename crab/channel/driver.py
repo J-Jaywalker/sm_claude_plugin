@@ -29,6 +29,18 @@ from crab.ui.protocol import _UI
 
 log = logging.getLogger("crab.channel.driver")
 
+# Maps notify_action's typed action_type to the legacy "[PREFIX]" label
+# the bubble renderer already knows how to display.
+_ACTION_PREFIXES: dict[str, str] = {
+    "edit": "EDIT",
+    "write": "WRITE",
+    "read": "READ",
+    "bash": "BASH",
+    "search": "SEARCH",
+    "delete": "DELETE",
+    "other": "ACTION",
+}
+
 # Where the hidden PTY's stdout is captured for debugging.
 _PTY_LOG = Path("/tmp/crab-claude.pty.log")
 _DEBUG_LOG = Path("/tmp/crab-channel-debug.log")
@@ -93,7 +105,8 @@ async def channel_driver(
         # Pre-allow all of our own channel-infrastructure tools so they don't
         # round-trip through the voice permission relay. Edit/Write/Bash and
         # other Claude built-ins still go through the relay.
-        "--allowedTools", "mcp__crab__reply,mcp__crab__ask_menu",
+        "--allowedTools",
+        "mcp__crab__reply,mcp__crab__ask_menu,mcp__crab__notify_action,mcp__crab__set_status",
         "--dangerously-load-development-channels", "server:crab",
     ]
     log.info("spawning: %s", " ".join(cmd))
@@ -229,6 +242,17 @@ async def channel_driver(
                     _relay_menu(ui, controller, sock_writer, msg),
                     name=f"menu-{msg.get('request_id', '?')}",
                 )
+            elif t == bridge.NOTIFY_ACTION:
+                action_type = (msg.get("action_type") or "other").lower()
+                target = msg.get("target") or ""
+                summary = msg.get("summary") or ""
+                prefix = _ACTION_PREFIXES.get(action_type, "ACTION")
+                label = f"[{prefix}] {target}"
+                if summary:
+                    label = f"{label} — {summary}"
+                ui.add_tool_use(label)
+            elif t == bridge.STATUS_UPDATE:
+                ui.set_label(msg.get("label") or "")
 
     tasks.append(asyncio.create_task(_prompts_to_channel(), name="prompts→channel"))
     tasks.append(asyncio.create_task(_channel_to_ui(), name="channel→ui"))

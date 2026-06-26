@@ -166,6 +166,9 @@ class CrabApp(App[None]):
         # user can press Ctrl+T to opt in when they want to click (e.g. the
         # settings panel), and Ctrl+S opens settings via keyboard regardless.
         self._mouse_capture_enabled: bool = False
+        # Optional Claude-controlled status label (set via mcp__crab__set_status).
+        # Empty string means "use the default cycling crab puns".
+        self._custom_label: str = ""
         # TTS playback is serialized through this queue so concurrent narrate /
         # <tts> / menu-question requests never interrupt each other. Items are
         # (text, optional Future that resolves once that clip finishes).
@@ -243,7 +246,9 @@ class CrabApp(App[None]):
             color = "bright_green"
         else:
             art = _CRAB_ART["thinking"][(self._frame // 5) % 2]
-            label = _THINKING_LABELS[(self._frame // 25) % len(_THINKING_LABELS)]
+            label = self._custom_label or _THINKING_LABELS[
+                (self._frame // 25) % len(_THINKING_LABELS)
+            ]
             color = "bright_yellow"
         t = Text(art, style=color, justify="center")
         panel = Panel(
@@ -498,8 +503,21 @@ class CrabApp(App[None]):
             status == "idle" and prev == "thinking"
         ):
             self._chime("Pop")
+        # Clear Claude-set status label when returning to idle so the next
+        # turn doesn't inherit stale flavour text.
+        if status == "idle":
+            self._custom_label = ""
         if status != "listening":
             self.query_one("#cmd-input", Input).placeholder = "Type a command or speak..."
+        self._render_visualiser()
+
+    def set_label(self, label: str) -> None:
+        """Override the cycling thinking label with Claude-controlled text.
+
+        Pass an empty string to revert to the default crab puns. Called from
+        the channel driver in response to the `set_status` MCP tool.
+        """
+        self._custom_label = (label or "").strip()
         self._render_visualiser()
 
     def _chime(self, name: str) -> None:

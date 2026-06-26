@@ -54,35 +54,61 @@ A typical turn calls `reply` once at the end with `kind="assistant"`. Longer
 multi-step work may sprinkle `kind="narrate"` updates as you go and end with a
 single `kind="assistant"` summary.
 
-### Announcing tool actions with `kind="tool_use"`
+### Announcing tool actions — use `notify_action`
 
 Before performing a meaningful tool action (Edit, Write, Bash, or an MCP tool
-call that mutates state), call `reply` with `kind="tool_use"` and a brief
-inline header so the user can see what's about to happen. Examples:
+call that mutates state), call the `mcp__crab__notify_action` tool with a
+typed action and target. The TUI renders it as a structured tool-use segment
+inside the current assistant bubble.
 
-- `reply(text="[EDIT] crab/asr/controller.py", kind="tool_use")` before editing
-- `reply(text="[BASH] pytest tests/test_voice.py", kind="tool_use")` before running
-- `reply(text="[WRITE] /tmp/output.json", kind="tool_use")` before creating a file
+```
+notify_action(action_type="edit",  target="crab/asr/controller.py", summary="bcrypt rollout")
+notify_action(action_type="bash",  target="pytest tests/test_voice.py")
+notify_action(action_type="write", target="/tmp/output.json")
+```
 
-Rules for tool-use headers:
-- Keep them short — file path or command essence, not full content. Truncate
-  long commands or paths after about 80 characters.
-- One header per imminent action. Don't combine multiple actions in one header.
-- Skip them for read-only tools (Read, Glob, Grep) — they don't need user
-  awareness and would just clutter the bubble.
-- The header is rendered as an inline tool-use segment **within the current
-  assistant bubble**, so multiple tool actions in one turn build up visibly
-  underneath each other.
+Rules:
+- `action_type` is one of: `edit`, `write`, `read`, `bash`, `search`, `delete`,
+  `other`.
+- `target` is short — file path, command essence, search term. Truncate long
+  values after ~80 chars.
+- `summary` is optional. Omit unless it adds meaningful intent ("bcrypt rollout",
+  "drop legacy_users table"); don't repeat the target.
+- One call per imminent action — don't batch multiple actions in one header.
+- Skip for cheap read-only tools (Read, Glob, Grep). They don't need
+  announcement and would clutter the bubble.
 
-When the action requires permission (Edit, Write, Bash), the user will hear a
-voice prompt **after** your tool-use header. So the order in a typical
-edit turn is:
+Typical edit turn order:
 
-1. `reply(kind="tool_use", text="[EDIT] foo.py")`
-2. The Edit tool call (triggers permission_request → user hears it → voice
-   yes/no → verdict)
+1. `notify_action(action_type="edit", target="foo.py")`
+2. The Edit tool call (triggers permission_request → user hears it via TTS →
+   voice yes/no → verdict)
 3. Edit executes
 4. `reply(kind="assistant", text="...summary... <tts>...</tts>")`
+
+(The older pattern `reply(kind="tool_use", text="[EDIT] foo.py")` still works,
+but `notify_action` is preferred — it carries typed metadata that the renderer
+and any future audit/log tooling can use.)
+
+### Setting the status label — `set_status`
+
+The crab visualiser cycles random labels ("Snipping...", "Pondering...",
+"Quantumizing...") during the thinking state. Override these with a short
+descriptive phrase when you're in a long operation so the user knows what's
+happening:
+
+```
+set_status(label="Reading config")
+set_status(label="Running pytest")
+set_status(label="Refactoring auth layer")
+```
+
+Rules:
+- Keep labels short — 2–4 words, present-participle (`-ing`) reads naturally.
+- Update as you switch between phases (read → think → write).
+- Pass `label=""` to revert to the random crab puns. Not strictly necessary —
+  the system auto-clears the label when the turn ends.
+- Don't call this on every tiny step; aim for one update per meaningful phase.
 
 ### `kind="narrate"` for spoken-only progress updates
 
