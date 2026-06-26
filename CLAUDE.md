@@ -110,21 +110,84 @@ Rules:
   verbatim** so the listener hears exactly what to answer.
 - Never include the literal characters `<tts>` anywhere else in the response.
 
-## Questions and selections — prefer yes/no
+## Voice-first defaults
 
-The user answers by voice. Yes/no questions are easy. Multi-choice menus are
-hard — there is no keyboard available to pick option 3.
+The user is **listening**, not reading. That changes your defaults:
 
-Guidelines:
-- Default to phrasing decisions as yes/no questions, or as a single open question
-  that can be answered in a sentence.
-- If you absolutely need a multi-choice selection from a list, call the
-  `mcp__crab__ask_menu` tool (when available — coming in a later phase) instead
-  of presenting numbered options in text. The TUI will surface a click-to-select
-  modal for these.
-- Avoid offering more than two paths in a single response. If the choice is
-  genuinely complex, narrate the situation and ask the user what to do next in
-  free-form.
+- **Lists of choices belong in `ask_menu`, not in text.** Whenever you find
+  yourself about to write "Here are the options: 1. X, 2. Y, 3. Z — which
+  would you like?", **call `ask_menu` instead**, without being asked. A voice
+  user cannot comfortably say "option 3" — they need to click.
+- **Long structured content** (tables, deep nested lists) is hard to follow
+  by ear. Put the takeaway in the `<tts>` block; let the visible bubble carry
+  the detail.
+- **File paths, URLs, code identifiers** read poorly aloud. In the `<tts>`
+  block refer to them by purpose ("the auth module", "the config file"), not
+  the raw string.
+- **Yes/no questions** are the easiest follow-up — prefer them when you can.
+  If you can't reduce to yes/no, that's exactly when `ask_menu` is the right
+  tool.
+
+## Questions and selections
+
+Decision tree:
+
+1. Can the question be answered yes/no? → ask it in plain text + `<tts>`.
+2. Does it require picking one item from a small fixed list? → **`ask_menu`**.
+3. Open-ended ("how should I approach this?") → narrate the situation and
+   wait for a free-form response.
+
+### `ask_menu` — use this proactively
+
+Call `ask_menu` **without waiting for the user to request it** any time you'd
+otherwise enumerate options for them to pick from. Examples where you should
+reach for `ask_menu` autonomously:
+
+- The user said "give me a few options for X". Pick 2-4 distinct ones and
+  hand them to `ask_menu`. Don't paste them as numbered text first.
+- You found several files matching a pattern and need to know which to edit.
+- You're suggesting a refactor and want the user to choose between distinct
+  strategies.
+- You hit an ambiguity that has a small set of reasonable resolutions.
+
+```
+ask_menu(
+  question="Which build target should I run?",
+  options=["dev", "production", "test"],
+)
+```
+
+The tool returns the selected index and label as text (e.g.
+`"selected index 1: 'production'"`), or `"cancelled"` if the user dismisses
+the modal with Escape. Read the result and continue based on the selection.
+
+Rules:
+- Keep `question` short — one sentence.
+- 2-4 options is the sweet spot; 6 is the hard maximum.
+- Use plain noun-phrase labels, not full sentences. The modal renders them as
+  buttons; long labels truncate awkwardly.
+- Tell the user out loud (via `<tts>` or `<narrate>`) that a menu is being
+  shown — voice users won't see it pop up otherwise.
+- After the menu returns, send a final `kind="assistant"` reply confirming
+  the choice you'll act on (so the user gets a closing acknowledgment via TTS).
+
+#### Anti-pattern — don't do this
+
+```
+Here are three approaches:
+1. Complete rewrite
+2. Incremental polish
+3. Tackle just the headings
+
+Which would you prefer?
+
+<tts>Which approach would you prefer: a complete rewrite, incremental polish,
+or just the headings?</tts>
+```
+
+A voice user can't comfortably answer "the second one" and shouldn't have
+the third option spoken before they've decided on the first. Use `ask_menu`
+with the same three options instead.
 
 ## Examples
 

@@ -4,22 +4,16 @@ Streams microphone audio to Speechmatics RT ASR. On first run, enrolls the
 speaker by capturing 30 seconds of audio and saving identifiers to speakers.txt.
 On subsequent runs, loads enrolled speakers and ignores transcripts from
 unrecognised voices. Detects wake phrase "CRAB-BOT" in finals, accumulates
-until EndOfUtterance, then submits the prompt to Claude Code.
-
-Two backends:
-  - default: long-running interactive Claude driven via a custom MCP channel
-    (crab.channel.server) — preserves permission gating and a single session
-  - --legacy: per-turn `claude -p` subprocess (the original PoC path)
+until EndOfUtterance, then forwards the prompt to a long-running interactive
+Claude Code session via a custom MCP channel (crab.channel.server).
 
 Usage:
     SPEECHMATICS_API_KEY=... python voice_controller.py
-    SPEECHMATICS_API_KEY=... python voice_controller.py --legacy
     DEBUG=1 SPEECHMATICS_API_KEY=... python voice_controller.py
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import os
 
@@ -72,35 +66,10 @@ def _build_transcription_config(
 
 
 # ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Speechmatics voice controller for Claude Code.",
-    )
-    parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help=(
-            "Fall back to the original `claude -p` subprocess driver. Default is "
-            "the channels MCP path (long-running interactive Claude under a hidden "
-            "PTY, bridged via a custom MCP server). Permission relay for the "
-            "channels path lands in Phase 2 — until then non-Read tool calls are "
-            "auto-denied with a visible error."
-        ),
-    )
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    args = _parse_args()
-    use_channels = not args.legacy
-
     api_key = _require_api_key()
 
     audio_format = AudioFormat(
@@ -127,7 +96,6 @@ async def main() -> None:
         transcription_config=transcription_config,
         speaker_name=speaker_name,
         enrolled_labels=enrolled_labels,
-        use_channels=use_channels,
     )
     await app.run_async()
 

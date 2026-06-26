@@ -19,12 +19,15 @@ import asyncio
 import itertools
 import json
 import logging
+import secrets
+import string
 import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from crab.channel import bridge
+from crab.config import _DEBUG
 
 # Stdout is reserved for JSON-RPC; all diagnostics go to stderr.
 logging.basicConfig(
@@ -38,6 +41,8 @@ _DEBUG_LOG = Path("/tmp/crab-channel-debug.log")
 
 
 def _dlog(msg: str) -> None:
+    if not _DEBUG:
+        return
     try:
         with _DEBUG_LOG.open("a") as f:
             f.write(f"{time.time():.3f}  server  {msg}\n")
@@ -69,6 +74,43 @@ _REPLY_TOOL: dict[str, Any] = {
         "required": ["text"],
     },
 }
+
+_ASK_MENU_TOOL: dict[str, Any] = {
+    "name": "ask_menu",
+    "description": (
+        "Ask the user to pick one option from a short list. Use this ONLY when "
+        "the choice genuinely can't be phrased as yes/no — yes/no can be "
+        "answered by voice, but a multi-choice menu requires the user to click "
+        "in the TUI. Returns the selected option's index (0-based) and label, "
+        "or 'cancelled' if dismissed. Keep options to 4 or fewer."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "Short question shown at the top of the menu modal",
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 6,
+                "description": "Labels for each selectable option",
+            },
+        },
+        "required": ["question", "options"],
+    },
+}
+
+# Pending ask_menu calls: request_id → Future that resolves with the selected int.
+_pending_menus: dict[str, asyncio.Future[int]] = {}
+
+
+def _new_request_id() -> str:
+    """5-char lowercase id, matching the format Claude uses for permission ids."""
+    alphabet = string.ascii_lowercase.replace("l", "")  # avoid 1/l confusion
+    return "".join(secrets.choice(alphabet) for _ in range(5))
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +180,7 @@ async def _claude_inbound_loop(sock_writer: asyncio.StreamWriter) -> None:
             await _send_jsonrpc({
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {"tools": [_REPLY_TOOL]},
+                "result": {"tools": [_REPLY_TOOL, _ASK_MENU_TOOL]},
             })
         elif method == "tools/call":
             await _handle_tool_call(msg_id, params, sock_writer)
@@ -181,12 +223,62 @@ async def _handle_tool_call(
             "id": msg_id,
             "result": {"content": [{"type": "text", "text": "ok"}]},
         })
+    elif name == "ask_menu":
+        await _handle_ask_menu(msg_id, args, sock_writer)
     else:
         await _send_jsonrpc({
             "jsonrpc": "2.0",
             "id": msg_id,
             "error": {"code": -32601, "message": f"unknown tool: {name}"},
         })
+
+
+async def _handle_ask_menu(
+    msg_id: Any,
+    args: dict[str, Any],
+    sock_writer: asyncio.StreamWriter,
+) -> None:
+    """Forward an ask_menu tool call to the parent and await the user's pick."""
+    question = (args.get("question") or "").strip()
+    options = args.get("options") or []
+    if not question or len(options) < 2:
+        await _send_jsonrpc({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32602, "message": "ask_menu needs a question and ≥2 options"},
+        })
+        return
+
+    request_id = _new_request_id()
+    future: asyncio.Future[int] = asyncio.get_event_loop().create_future()
+    _pending_menus[request_id] = future
+    n = next(_tool_counter)
+    _dlog(f"tool_call #{n} ask_menu id={request_id} q={question!r} opts={options!r}")
+
+    await bridge.send_message(sock_writer, {
+        "type": bridge.MENU_REQUEST,
+        "request_id": request_id,
+        "question": question,
+        "options": options,
+    })
+
+    try:
+        selected = await future
+    except asyncio.CancelledError:
+        _pending_menus.pop(request_id, None)
+        raise
+
+    if selected < 0 or selected >= len(options):
+        result_text = "cancelled"
+    else:
+        result_text = f"selected index {selected}: {options[selected]!r}"
+
+    _dlog(f"ask_menu {request_id} resolved: {result_text}")
+    await _send_jsonrpc({
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "result": {"content": [{"type": "text", "text": result_text}]},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +313,14 @@ async def _parent_inbound_loop(sock_reader: asyncio.StreamReader) -> None:
                     "behavior": msg["behavior"],
                 },
             })
+        elif t == bridge.MENU_RESPONSE:
+            request_id = msg.get("request_id", "")
+            selected = int(msg.get("selected", -1))
+            future = _pending_menus.pop(request_id, None)
+            if future is not None and not future.done():
+                future.set_result(selected)
+            else:
+                log.warning("menu_response with no pending future: %s", request_id)
         elif t == bridge.SHUTDOWN:
             log.info("parent requested shutdown")
             return

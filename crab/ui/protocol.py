@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio  # noqa: F401  (referenced in async type hints)
 from typing import Protocol
 
 
@@ -19,3 +20,9 @@ class _UI(Protocol):
     def speak(self, text: str) -> None: ...
     async def speak_and_wait(self, text: str) -> None: ...
     def finalise_assistant_turn(self) -> None: ...
+    async def show_menu(
+        self,
+        question: str,
+        options: list[str],
+        external_result: "asyncio.Future[int] | None" = None,
+    ) -> int: ...

@@ -33,7 +33,6 @@ from speechmatics.rt import (
 from crab.asr.controller import VoiceController, _State
 from crab.asr.pumps import _audio_pump
 from crab.channel.driver import channel_driver
-from crab.claude.driver import claude_driver
 from crab.config import (
     _ANSI_ESCAPE,
     _CRAB_ART,
@@ -137,7 +136,6 @@ class CrabApp(App[None]):
         transcription_config: TranscriptionConfig,
         speaker_name: str,
         enrolled_labels: set[str],
-        use_channels: bool = True,
     ) -> None:
         super().__init__()
         self._api_key = api_key
@@ -145,7 +143,6 @@ class CrabApp(App[None]):
         self._transcription_config = transcription_config
         self._speaker_name = speaker_name
         self._enrolled_labels = enrolled_labels
-        self._use_channels = use_channels
 
         self._status = "idle"
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
@@ -384,6 +381,36 @@ class CrabApp(App[None]):
         self._wake_word_threshold = event.wake_word_threshold
         if self._controller is not None:
             self._controller.enrolled_labels = event.enrolled_labels
+
+    async def show_menu(
+        self,
+        question: str,
+        options: list[str],
+        external_result: asyncio.Future[int] | None = None,
+    ) -> int:
+        """Push a click- or voice-to-select modal and return the chosen index.
+
+        Returns -1 if the user dismisses the modal without choosing. If
+        `external_result` is supplied, the modal closes when that future
+        resolves — used by the channel driver to wire voice answers in.
+
+        Uses the callback form of push_screen rather than push_screen_wait,
+        because the channel driver runs as a regular asyncio task — not a
+        Textual worker — and push_screen_wait raises a NoActiveWorker error
+        in that context.
+        """
+        from crab.ui.modals import SelectMenuModal
+
+        result_future: asyncio.Future[int] = asyncio.get_event_loop().create_future()
+
+        def _on_dismiss(value: int | None) -> None:
+            if result_future.done():
+                return
+            result_future.set_result(int(value) if value is not None else -1)
+
+        modal = SelectMenuModal(question, options, external_result=external_result)
+        self.push_screen(modal, _on_dismiss)
+        return await result_future
 
     def action_toggle_mouse(self) -> None:
         """Toggle Textual's mouse capture so text can be selected natively.
@@ -686,14 +713,13 @@ class CrabApp(App[None]):
                     ),
                     name="audio-pump",
                 )
-                driver_fn = channel_driver if self._use_channels else claude_driver
                 driver_task = asyncio.create_task(
-                    driver_fn(
+                    channel_driver(
                         controller=controller,
                         ui=self,
                         stop_event=stop_event,
                     ),
-                    name="channel-driver" if self._use_channels else "claude-driver",
+                    name="channel-driver",
                 )
 
                 if one_shot and session_stop is not None:

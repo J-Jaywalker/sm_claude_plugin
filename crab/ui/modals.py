@@ -34,6 +34,101 @@ def _render_level(level: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Channel ask_menu modal (Phase 3d)
+# ---------------------------------------------------------------------------
+
+class SelectMenuModal(ModalScreen[int]):
+    """Click- or voice-to-select modal used by the channel's ask_menu tool.
+
+    Returns the integer index of the selected option, or -1 if cancelled.
+
+    If `external_result` is provided, the modal also watches that future and
+    dismisses itself when it resolves — this is how the channel driver wires
+    voice answers into the modal lifecycle.
+    """
+
+    CSS = """
+    SelectMenuModal { align: center middle; }
+    #menu-container {
+        width: 80; height: auto;
+        background: $surface; border: round #29A383; padding: 1 2;
+    }
+    #menu-question {
+        text-align: center; color: #29A383; margin-bottom: 1;
+    }
+    #menu-hint {
+        text-align: center; color: $text-muted; margin-bottom: 1;
+    }
+    #menu-options { width: 100%; height: auto; }
+    .menu-option { width: 100%; margin-bottom: 1; }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        question: str,
+        options: list[str],
+        external_result: asyncio.Future[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self._question = question
+        self._options = options
+        self._external_result = external_result
+        self._external_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="menu-container"):
+            yield Static(self._question, id="menu-question")
+            if self._external_result is not None:
+                yield Static(
+                    "Click an option or say its name / number",
+                    id="menu-hint",
+                )
+            with Vertical(id="menu-options"):
+                for i, option in enumerate(self._options):
+                    yield Button(
+                        option,
+                        id=f"menu-opt-{i}",
+                        classes="menu-option",
+                    )
+
+    def on_mount(self) -> None:
+        if self._external_result is not None:
+            self._external_task = asyncio.create_task(
+                self._watch_external(), name="menu-voice-watch"
+            )
+
+    async def _watch_external(self) -> None:
+        try:
+            idx = await self._external_result  # type: ignore[arg-type]
+        except (asyncio.CancelledError, Exception):
+            return
+        self._safe_dismiss(idx)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id and event.button.id.startswith("menu-opt-"):
+            idx = int(event.button.id.removeprefix("menu-opt-"))
+            self._safe_dismiss(idx)
+
+    def action_cancel(self) -> None:
+        self._safe_dismiss(-1)
+
+    def _safe_dismiss(self, idx: int) -> None:
+        """Dismiss exactly once; tolerate races between voice and click."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._external_task is not None and not self._external_task.done():
+            self._external_task.cancel()
+        try:
+            self.dismiss(idx)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Enrollment modal
 # ---------------------------------------------------------------------------
 

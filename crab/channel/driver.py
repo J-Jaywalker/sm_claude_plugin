@@ -1,12 +1,9 @@
 """Channels-mode driver: hidden-PTY Claude + Unix socket bridge.
 
-Drop-in alternative to crab.claude.driver.claude_driver. Starts a single
-long-running Claude session under a hidden PTY, owns the Unix socket the MCP
-child connects to, and pumps prompts/replies in both directions.
-
-Phase 1 scope: prompt → reply only. Permission requests received from the
-channel are auto-denied with a visible UI error; Phase 2 wires the voice-driven
-approval flow.
+Starts a single long-running Claude session under a hidden PTY, owns the Unix
+socket the MCP child connects to, and pumps messages in both directions:
+voice prompts → channel notification, permission requests → voice yes/no →
+verdict, reply tool calls → chat bubble + TTS, ask_menu → click modal.
 """
 
 from __future__ import annotations
@@ -25,7 +22,9 @@ from typing import Optional
 
 from crab.asr.controller import VoiceController
 from crab.channel import bridge
+from crab.channel.menu_select import llm_interpret_menu
 from crab.channel.yes_no import parse_yes_no
+from crab.config import _DEBUG
 from crab.ui.protocol import _UI
 
 log = logging.getLogger("crab.channel.driver")
@@ -39,7 +38,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _dlog(msg: str) -> None:
-    """Append a timestamped line to the shared channel debug log."""
+    """Append a timestamped line to the shared channel debug log when DEBUG=1."""
+    if not _DEBUG:
+        return
     try:
         with _DEBUG_LOG.open("a") as f:
             f.write(f"{time.time():.3f}  driver  {msg}\n")
@@ -89,7 +90,10 @@ async def channel_driver(
         "claude",
         "--mcp-config", str(_MCP_CONFIG),
         "--strict-mcp-config",
-        "--allowedTools", "mcp__crab__reply",
+        # Pre-allow all of our own channel-infrastructure tools so they don't
+        # round-trip through the voice permission relay. Edit/Write/Bash and
+        # other Claude built-ins still go through the relay.
+        "--allowedTools", "mcp__crab__reply,mcp__crab__ask_menu",
         "--dangerously-load-development-channels", "server:crab",
     ]
     log.info("spawning: %s", " ".join(cmd))
@@ -205,6 +209,13 @@ async def channel_driver(
                     controller.response_done.set()
             elif t == bridge.PERMISSION_REQUEST:
                 await _relay_permission(ui, controller, sock_writer, msg)
+            elif t == bridge.MENU_REQUEST:
+                # Fire-and-forget: the modal can sit open while other
+                # messages flow. Server-side correlates by request_id.
+                asyncio.create_task(
+                    _relay_menu(ui, controller, sock_writer, msg),
+                    name=f"menu-{msg.get('request_id', '?')}",
+                )
 
     tasks.append(asyncio.create_task(_prompts_to_channel(), name="prompts→channel"))
     tasks.append(asyncio.create_task(_channel_to_ui(), name="channel→ui"))
@@ -291,6 +302,114 @@ async def _relay_permission(
         "type": bridge.PERMISSION_VERDICT,
         "request_id": request_id,
         "behavior": verdict,
+    })
+
+
+async def _relay_menu(
+    ui: _UI,
+    controller: VoiceController,
+    sock_writer: asyncio.StreamWriter,
+    msg: dict,
+) -> None:
+    """Race click-modal vs voice answer; send back the chosen index.
+
+    Flow:
+      1. Show the question + options visually in the chat
+      2. Speak the question via TTS, blocking the mic
+      3. Chime + flip visualiser to listening + open the mic
+      4. Race the modal click and the controller's menu_received event;
+         first to resolve wins (modal dismisses either way)
+      5. Close the mic, pop chime, send the verdict back
+    """
+    request_id = msg.get("request_id", "")
+    question = msg.get("question", "")
+    options = list(msg.get("options") or [])
+    _dlog(f"menu_request id={request_id} q={question!r} opts={options!r}")
+
+    ui.add_tool_use(f"[MENU] {question}")
+    for i, opt in enumerate(options):
+        ui.add_tool_use(f"  {i + 1}. {opt}")
+
+    # Block while TTS plays so we don't transcribe our own audio.
+    await ui.speak_and_wait(question)
+
+    # Open the listening window. set_status("listening") fires the Ping chime
+    # and flips the visualiser to green; begin_menu_listen routes voice into
+    # the menu-select parser instead of the wake-word state machine.
+    controller.begin_menu_listen(options)
+    controller.listening.set()
+    ui.set_status("listening")
+
+    voice_future: asyncio.Future[int] = asyncio.get_event_loop().create_future()
+
+    async def _watch_voice() -> None:
+        """React to each EoU until we resolve voice_future or the modal closes.
+
+        Loop iterations:
+          - Rule-based parser matched (>=0 or CANCEL) → resolve, done.
+          - Rule-based returned -2 → close the mic, ask the LLM, then either
+            resolve or reopen the listening window for the user to retry.
+        """
+        while not voice_future.done():
+            await controller.menu_received.wait()
+            controller.menu_received.clear()
+            ans = controller.menu_answer
+            spoken = controller.menu_spoken_text
+
+            if ans != -2:
+                # Clean rule-based decision (real index, or CANCEL).
+                if not voice_future.done():
+                    voice_future.set_result(ans)
+                return
+
+            # Rule-based couldn't match — pause listening while we ask the LLM.
+            controller.menu_listening = False
+            controller.listening.clear()
+            ui.set_status("thinking")
+            ui.add_tool_use(f"[MENU] interpreting {spoken!r}...")
+
+            llm_idx = await llm_interpret_menu(spoken, options)
+
+            if llm_idx is not None:
+                ui.add_tool_use(f"[MENU] LLM picked option {llm_idx}")
+                if not voice_future.done():
+                    voice_future.set_result(llm_idx)
+                return
+
+            # LLM also couldn't decide. Show an error, reopen the listening
+            # window, and let the user try again or click.
+            ui.add_error_message(
+                f"[MENU] couldn't tell from {spoken!r} — try again or click."
+            )
+            controller.begin_menu_listen(options)
+            controller.listening.set()
+            ui.set_status("listening")
+
+    voice_task = asyncio.create_task(_watch_voice(), name=f"menu-voice-{request_id}")
+
+    try:
+        selected = await ui.show_menu(question, options, external_result=voice_future)
+    except Exception as e:  # noqa: BLE001
+        ui.add_error_message(f"[CHANNEL] menu modal failed: {e}")
+        selected = -1
+    finally:
+        voice_task.cancel()
+        controller.end_menu_listen()
+        controller.listening.clear()
+        # set_status("thinking") fires the Pop chime so the user knows the
+        # listening window has closed and Claude is now processing.
+        ui.set_status("thinking")
+
+    if 0 <= selected < len(options):
+        ui.add_tool_use(f"[CHOICE] {options[selected]}")
+    else:
+        ui.add_tool_use("[CHOICE] (cancelled)")
+
+    _dlog(f"sending menu_response id={request_id} selected={selected}")
+    await bridge.send_message(sock_writer, {
+        "type": bridge.MENU_RESPONSE,
+        "request_id": request_id,
+        "selected": selected,
     })
 
 

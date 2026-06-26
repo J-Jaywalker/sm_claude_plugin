@@ -10,12 +10,15 @@ Wire format (one JSON object per line, UTF-8, terminated with \\n):
   parent → child:
     {"type": "push_prompt",        "content": str, "meta": {str: str}}
     {"type": "permission_verdict", "request_id": str, "behavior": "allow" | "deny"}
+    {"type": "menu_response",      "request_id": str, "selected": int}
     {"type": "shutdown"}
   child → parent:
     {"type": "ready"}                                                    handshake
     {"type": "reply",              "text": str, "kind": str | None}      kind ∈ {assistant, narrate, tool_use, None}
     {"type": "permission_request", "request_id": str, "tool_name": str,
                                    "description": str, "input_preview": str}
+    {"type": "menu_request",       "request_id": str, "question": str,
+                                   "options": [str]}
 """
 
 from __future__ import annotations
@@ -31,10 +34,12 @@ SOCKET_PATH = Path("/tmp/crab-bot.sock")
 # Message type constants (use these instead of string literals)
 PUSH_PROMPT = "push_prompt"
 PERMISSION_VERDICT = "permission_verdict"
+MENU_RESPONSE = "menu_response"
 SHUTDOWN = "shutdown"
 READY = "ready"
 REPLY = "reply"
 PERMISSION_REQUEST = "permission_request"
+MENU_REQUEST = "menu_request"
 
 
 async def send_message(writer: asyncio.StreamWriter, msg: dict[str, Any]) -> None:
