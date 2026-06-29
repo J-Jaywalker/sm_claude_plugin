@@ -8,10 +8,7 @@ import subprocess
 from collections import deque
 from typing import Any
 
-from rich import box as rich_box
 from rich.align import Align
-from rich.console import Group
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
@@ -42,10 +39,10 @@ from crab.config import (
     _RT_URL,
     _THINKING_LABELS,
 )
-from crab.tts.base import _extract_tts
-from crab.tts.macos import _TTS_PROVIDER_MACOS
-from crab.ui.modals import SettingsModal
-from crab.ui.rendering import _Bubble
+from crab.tts import _extract_tts
+from crab.tts.queue import TtsQueue
+from crab.ui.modals import SelectMenuModal, SettingsModal
+from crab.ui.rendering import render_history
 from crab.ui.widgets import SettingsPanel
 
 
@@ -150,13 +147,10 @@ class CrabApp(App[None]):
         self._frame = 0
         self._stop_event: asyncio.Event | None = None
         self._sm_task: asyncio.Task[None] | None = None
-        self._tts_proc: asyncio.subprocess.Process | None = None
         self._controller: VoiceController | None = None
         self._exiting = False
         self._restarting_sm = False
         self._rt_url: str | None = _RT_URL
-        self._tts_enabled: bool = True
-        self._tts_provider: str = _TTS_PROVIDER_MACOS
         self._device_index: int | None = None
         self._local_wake_word: bool = False
         self._wake_word_model: str = ""
@@ -169,13 +163,8 @@ class CrabApp(App[None]):
         # Optional Claude-controlled status label (set via mcp__crab__set_status).
         # Empty string means "use the default cycling crab puns".
         self._custom_label: str = ""
-        # TTS playback is serialized through this queue so concurrent narrate /
-        # <tts> / menu-question requests never interrupt each other. Items are
-        # (text, optional Future that resolves once that clip finishes).
-        self._tts_queue: asyncio.Queue[
-            tuple[str, asyncio.Future[None] | None] | None
-        ] = asyncio.Queue()
-        self._tts_worker_task: asyncio.Task[None] | None = None
+        # Serialized TTS playback (queue + worker live in crab.tts.queue).
+        self._tts = TtsQueue()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -196,7 +185,7 @@ class CrabApp(App[None]):
         self._render_history()
         self.set_interval(_DOT_INTERVAL, self._tick)
         self._sm_task = asyncio.create_task(self._run_speechmatics(), name="speechmatics")
-        self._tts_worker_task = asyncio.create_task(self._tts_worker(), name="tts-worker")
+        self._tts.start()
         # Mouse capture starts disabled — Textual's driver enables it during
         # startup, so we explicitly turn it back off now. Users opt in via
         # Ctrl+T when they want to click (e.g. settings panel).
@@ -213,19 +202,9 @@ class CrabApp(App[None]):
         self._exiting = True
         if self._stop_event is not None:
             self._stop_event.set()
-        # Tell the TTS worker to exit cleanly. Kill any in-flight clip so the
-        # event loop teardown doesn't block on a long `say` invocation.
-        try:
-            self._tts_queue.put_nowait(None)
-        except Exception:
-            pass
-        if self._tts_worker_task is not None and not self._tts_worker_task.done():
-            self._tts_worker_task.cancel()
-        if self._tts_proc is not None:
-            try:
-                self._tts_proc.kill()
-            except Exception:
-                pass
+        # Kill any in-flight TTS so the event loop teardown isn't blocked on a
+        # long `say` invocation.
+        self._tts.shutdown()
 
     # -- Animation tick -----------------------------------------------------
 
@@ -270,56 +249,7 @@ class CrabApp(App[None]):
         self.query_one("#instructions", Static).update(panel)
 
     def _render_history(self) -> None:
-        if not self._history:
-            content: Any = Align.center(Text("No conversation yet.", style="dim"))
-        else:
-            items: list[Any] = []
-            for msg in self._history:
-                role = msg["role"]
-                if role == "user":
-                    items.append(_Bubble(
-                        Text(msg["text"]),
-                        align="left",
-                        title=f"[bold cyan]{self._speaker_name}[/bold cyan]",
-                        box=rich_box.ROUNDED,
-                        border_style="cyan",
-                    ))
-                elif role == "assistant":
-                    parts: list[Any] = []
-                    text_chunks: list[str] = []
-                    for kind, seg in msg["segments"]:
-                        if kind == "text":
-                            text_chunks.append(seg)
-                        else:
-                            if text_chunks:
-                                combined = _NARRATE_TAG_RE.sub(
-                                    "", "".join(text_chunks)
-                                ).strip()
-                                display_text, _ = _extract_tts(combined)
-                                if display_text:
-                                    parts.append(Markdown(display_text))
-                                text_chunks = []
-                            parts.append(Text(seg, style="dim"))
-                    if text_chunks:
-                        combined = _NARRATE_TAG_RE.sub(
-                            "", "".join(text_chunks)
-                        ).strip()
-                        display_text, _ = _extract_tts(combined)
-                        if display_text:
-                            parts.append(Markdown(display_text))
-                    items.append(_Bubble(
-                        Group(*parts) if parts else Text(""),
-                        align="right",
-                        title="[dim]CRAB[/dim]",
-                        box=rich_box.ROUNDED,
-                        border_style="dim",
-                    ))
-                elif role == "done":
-                    items.append(Align.right(Text(msg["text"], style="dim")))
-                elif role == "error":
-                    items.append(Text(msg["text"], style="bright_red"))
-                items.append(Text(""))
-            content = Group(*items)
+        content = render_history(self._history, self._speaker_name)
         self.query_one("#history", Static).update(content)
         self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
@@ -366,8 +296,8 @@ class CrabApp(App[None]):
                         api_key=self._api_key,
                         audio_format=self._audio_format,
                         rt_url=self._rt_url,
-                        tts_enabled=self._tts_enabled,
-                        tts_provider=self._tts_provider,
+                        tts_enabled=self._tts.enabled,
+                        tts_provider=self._tts.provider,
                         device_index=self._device_index,
                         local_wake_word=self._local_wake_word,
                         wake_word_model=self._wake_word_model,
@@ -408,8 +338,8 @@ class CrabApp(App[None]):
 
     def on_crab_app_settings_changed(self, event: "CrabApp.SettingsChanged") -> None:
         self._rt_url = event.rt_url
-        self._tts_enabled = event.tts_enabled
-        self._tts_provider = event.tts_provider
+        self._tts.enabled = event.tts_enabled
+        self._tts.provider = event.tts_provider
         self._enrolled_labels = event.enrolled_labels
         self._device_index = event.device_index
         self._local_wake_word = event.local_wake_word
@@ -439,8 +369,6 @@ class CrabApp(App[None]):
         Textual worker — and push_screen_wait raises a NoActiveWorker error
         in that context.
         """
-        from crab.ui.modals import SelectMenuModal
-
         result_future: asyncio.Future[int] = asyncio.get_event_loop().create_future()
 
         def _on_dismiss(value: int | None) -> None:
@@ -485,7 +413,7 @@ class CrabApp(App[None]):
         self._controller.prompt_ready.set()
         event.input.clear()
 
-    # -- Public API (same interface as old UI class) ------------------------
+    # -- _UI protocol surface (used by VoiceController + channel driver) ----
 
     def set_status(self, status: str) -> None:
         prev = self._status
@@ -555,23 +483,21 @@ class CrabApp(App[None]):
         self._render_history()
 
     def _process_narrate_stream(self, new_text: str) -> None:
-        """Scan streaming text for ``<narrate>`` tags and speak them.
+        """Extract any ``<narrate>...</narrate>`` blocks in `new_text` and
+        queue their contents for TTS playback.
 
-        Appends the incoming chunk to a running scan buffer, extracts any
-        complete ``<narrate>...</narrate>`` blocks, and fires a TTS task
-        for each. Truncates the buffer once consumed (or when it grows
-        large with no open ``<narrate`` prefix) so memory stays bounded.
-
-        Args:
-            new_text: Newly arrived assistant text segment, already
-                ANSI-stripped.
+        Channel-mode replies arrive whole, but the scan still uses a running
+        buffer in case a single ``add_assistant_text`` call delivers a chunk
+        that ends mid-tag (then a follow-up reply completes the tag). The
+        buffer is reset once consumed, or shed if it grows beyond 500 chars
+        with no open ``<narrate`` prefix.
         """
         self._narrate_scan_buf += new_text
         matches = list(_NARRATE_TAG_RE.finditer(self._narrate_scan_buf))
         for m in matches:
             narrate_text = m.group(1).strip()
             if narrate_text:
-                self._enqueue_tts(narrate_text, wait=False)
+                self._tts.enqueue(narrate_text, wait=False)
         if matches:
             self._narrate_scan_buf = self._narrate_scan_buf[matches[-1].end():]
         elif (
@@ -581,10 +507,7 @@ class CrabApp(App[None]):
             self._narrate_scan_buf = ""
 
     def add_tool_use(self, label: str) -> None:
-        if label.startswith("[DONE]"):
-            self._finalise_assistant_tts()
-            self._history.append({"role": "done", "text": label})
-        elif self._history and self._history[-1]["role"] == "assistant":
+        if self._history and self._history[-1]["role"] == "assistant":
             self._history[-1]["segments"].append(("tool", label))
         else:
             self._history.append({"role": "assistant", "segments": [("tool", label)]})
@@ -628,84 +551,17 @@ class CrabApp(App[None]):
             msg["tts"] = tts_text
             if tts_text:
                 _LOGGER.info("TTS: %s", tts_text)
-                return self._enqueue_tts(tts_text, wait=True)
+                return self._tts.enqueue(tts_text, wait=True)
             return None
         return None
 
     def speak(self, text: str) -> None:
         """Fire-and-forget TTS. Queued; never interrupts whatever is playing."""
-        if not text.strip():
-            return
-        self._enqueue_tts(text, wait=False)
+        self._tts.speak(text)
 
     async def speak_and_wait(self, text: str) -> None:
         """Queue `text` and block until it finishes playing (after anything ahead)."""
-        if not text.strip():
-            return
-        fut = self._enqueue_tts(text, wait=True)
-        if fut is not None:
-            try:
-                await fut
-            except asyncio.CancelledError:
-                raise
-
-    def _enqueue_tts(
-        self, text: str, *, wait: bool
-    ) -> asyncio.Future[None] | None:
-        """Append a clip to the TTS playback queue.
-
-        Returns a Future that resolves when *this clip* finishes (only when
-        `wait=True`). Callers passing wait=False get None and rely on the
-        queue's FIFO ordering for correctness.
-        """
-        fut: asyncio.Future[None] | None = None
-        if wait:
-            fut = asyncio.get_event_loop().create_future()
-        try:
-            self._tts_queue.put_nowait((text, fut))
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("TTS enqueue failed: %s", exc)
-            if fut is not None and not fut.done():
-                fut.set_result(None)
-        return fut
-
-    async def _tts_worker(self) -> None:
-        """Single consumer that plays queued clips one at a time."""
-        while True:
-            try:
-                item = await self._tts_queue.get()
-            except asyncio.CancelledError:
-                return
-            if item is None:
-                return
-            text, fut = item
-            try:
-                if self._tts_enabled:
-                    await self._speak_one(text)
-            except asyncio.CancelledError:
-                if fut is not None and not fut.done():
-                    fut.set_result(None)
-                return
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("TTS error: %s", exc)
-            finally:
-                if fut is not None and not fut.done():
-                    fut.set_result(None)
-
-    async def _speak_one(self, text: str) -> None:
-        """Play a single TTS clip via the configured provider."""
-        if self._tts_provider == _TTS_PROVIDER_MACOS:
-            try:
-                self._tts_proc = await asyncio.create_subprocess_exec(
-                    "say", "-v", "Daniel (Enhanced)", text,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                await self._tts_proc.wait()
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("TTS failed: %s", exc)
-            finally:
-                self._tts_proc = None
+        await self._tts.speak_and_wait(text)
 
     def add_error_message(self, text: str) -> None:
         self._history.append({"role": "error", "text": text})

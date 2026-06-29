@@ -7,26 +7,14 @@ import re
 from enum import Enum
 from typing import Any
 
-from pathlib import Path
-import time
-
-from crab.channel.menu_select import parse_menu_choice
-from crab.config import _DEBUG, _IDLE_BUFFER_MAX, _WAKE_WORD_PATTERN
+from crab.asr.parsers.menu_select import parse_menu_choice
+from crab.config import _DEBUG, _IDLE_BUFFER_MAX, _WAKE_WORD_PATTERN, dlog
 from crab.speaker_store import _dominant_speaker
 from crab.ui.protocol import _UI
 
 
-_VOICE_DEBUG_LOG = Path("/tmp/crab-channel-debug.log")
-
-
 def _dlog(msg: str) -> None:
-    if not _DEBUG:
-        return
-    try:
-        with _VOICE_DEBUG_LOG.open("a") as f:
-            f.write(f"{time.time():.3f}  voice   {msg}\n")
-    except OSError:
-        pass
+    dlog("voice", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -63,15 +51,15 @@ class VoiceController:
         self.prompt_ready: asyncio.Event = asyncio.Event()
         self.last_prompt: str = ""
         self.response_done: asyncio.Event = asyncio.Event()
-        # Permission-relay listening mode (Phase 2). When active, voice input
-        # is captured into permission_answer instead of going through the
+        # Permission-relay listening mode. When active, voice input is
+        # captured into permission_answer instead of going through the
         # wake-word state machine.
         self.permission_listening: bool = False
         self._permission_buffer: list[str] = []
         self.permission_answer: str = ""
         self.permission_received: asyncio.Event = asyncio.Event()
-        # Menu-select listening mode (Phase 3d). When active, the next
-        # utterance is parsed against menu_options and yields an index.
+        # Menu-select listening mode. When active, the next utterance is
+        # parsed against menu_options and yields an index.
         # menu_answer encoding:
         #   >= 0  — rule-based parser matched an option index
         #   -1    — explicit CANCEL (user said "cancel", "never mind", ...)

@@ -1,10 +1,11 @@
-"""Rich renderables: markdown detection and chat-bubble panel."""
+"""Rich renderables: markdown detection, chat-bubble panel, history view."""
 
 from __future__ import annotations
 
 import io
 from typing import Any
 
+from rich import box as rich_box
 from rich.align import Align
 from rich.console import Console as _RichConsole
 from rich.console import Group
@@ -12,6 +13,10 @@ from rich.constrain import Constrain
 from rich.markdown import Markdown
 from rich.measure import Measurement
 from rich.panel import Panel
+from rich.text import Text
+
+from crab.config import _NARRATE_TAG_RE
+from crab.tts import _extract_tts
 
 
 # ---------------------------------------------------------------------------
@@ -93,3 +98,63 @@ class _Bubble:
             yield from Align.right(constrained).__rich_console__(console, options)
         else:
             yield from constrained.__rich_console__(console, options)
+
+
+# ---------------------------------------------------------------------------
+# Conversation history → renderable
+# ---------------------------------------------------------------------------
+
+def render_history(history: list[dict[str, Any]], speaker_name: str) -> Any:
+    """Build a Rich renderable for the conversation history list.
+
+    `history` items are dicts with a "role" key:
+      - "user": ``{"role": "user", "text": str}``
+      - "assistant": ``{"role": "assistant", "segments": [(kind, str), ...],
+                        "tts"?: str}`` where kind ∈ {"text", "tool"}
+      - "error": ``{"role": "error", "text": str}``
+    """
+    if not history:
+        return Align.center(Text("No conversation yet.", style="dim"))
+
+    items: list[Any] = []
+    for msg in history:
+        role = msg["role"]
+        if role == "user":
+            items.append(_Bubble(
+                Text(msg["text"]),
+                align="left",
+                title=f"[bold cyan]{speaker_name}[/bold cyan]",
+                box=rich_box.ROUNDED,
+                border_style="cyan",
+            ))
+        elif role == "assistant":
+            parts: list[Any] = []
+            text_chunks: list[str] = []
+            for kind, seg in msg["segments"]:
+                if kind == "text":
+                    text_chunks.append(seg)
+                else:
+                    if text_chunks:
+                        combined = _NARRATE_TAG_RE.sub("", "".join(text_chunks)).strip()
+                        display_text, _ = _extract_tts(combined)
+                        if display_text:
+                            parts.append(Markdown(display_text))
+                        text_chunks = []
+                    parts.append(Text(seg, style="dim"))
+            if text_chunks:
+                combined = _NARRATE_TAG_RE.sub("", "".join(text_chunks)).strip()
+                display_text, _ = _extract_tts(combined)
+                if display_text:
+                    parts.append(Markdown(display_text))
+            items.append(_Bubble(
+                Group(*parts) if parts else Text(""),
+                align="right",
+                title="[dim]CRAB[/dim]",
+                box=rich_box.ROUNDED,
+                border_style="dim",
+            ))
+        elif role == "error":
+            items.append(Text(msg["text"], style="bright_red"))
+        items.append(Text(""))
+
+    return Group(*items)

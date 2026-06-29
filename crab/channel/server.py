@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from crab.channel import bridge
-from crab.config import _DEBUG
+from crab.config import dlog as _shared_dlog
 
 # Stdout is reserved for JSON-RPC; all diagnostics go to stderr.
 logging.basicConfig(
@@ -37,17 +37,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("crab.channel.server")
 
-_DEBUG_LOG = Path("/tmp/crab-channel-debug.log")
-
-
 def _dlog(msg: str) -> None:
-    if not _DEBUG:
-        return
-    try:
-        with _DEBUG_LOG.open("a") as f:
-            f.write(f"{time.time():.3f}  server  {msg}\n")
-    except OSError:
-        pass
+    _shared_dlog("server", msg)
 
 
 _notif_counter = itertools.count(1)

@@ -14,23 +14,22 @@ import logging
 import os
 import pty
 import signal
-import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
 from crab.asr.controller import VoiceController
+from crab.asr.parsers.menu_select import llm_interpret_menu
+from crab.asr.parsers.yes_no import parse_yes_no
 from crab.channel import bridge
-from crab.channel.menu_select import llm_interpret_menu
-from crab.channel.yes_no import parse_yes_no
-from crab.config import _DEBUG
+from crab.config import dlog
 from crab.ui.protocol import _UI
 
 log = logging.getLogger("crab.channel.driver")
 
-# Maps notify_action's typed action_type to the legacy "[PREFIX]" label
-# the bubble renderer already knows how to display.
+# Maps notify_action's typed action_type to the "[PREFIX]" label the bubble
+# renderer displays as a tool-use segment.
 _ACTION_PREFIXES: dict[str, str] = {
     "edit": "EDIT",
     "write": "WRITE",
@@ -43,21 +42,13 @@ _ACTION_PREFIXES: dict[str, str] = {
 
 # Where the hidden PTY's stdout is captured for debugging.
 _PTY_LOG = Path("/tmp/crab-claude.pty.log")
-_DEBUG_LOG = Path("/tmp/crab-channel-debug.log")
 _MCP_CONFIG = Path(__file__).parent / "mcp.json"
 # crab/channel/driver.py → crab/channel/ → crab/ → project root
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _dlog(msg: str) -> None:
-    """Append a timestamped line to the shared channel debug log when DEBUG=1."""
-    if not _DEBUG:
-        return
-    try:
-        with _DEBUG_LOG.open("a") as f:
-            f.write(f"{time.time():.3f}  driver  {msg}\n")
-    except OSError:
-        pass
+    dlog("driver", msg)
 
 
 async def channel_driver(

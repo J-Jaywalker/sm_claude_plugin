@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from pathlib import Path
 from typing import Any
 
 
@@ -18,6 +20,25 @@ _SPEAKERS_FILE = os.path.join(os.path.dirname(__file__), "..", "speakers.txt")
 _ENROLLMENT_SECONDS = 30
 
 _RT_URL = "ws://127.0.0.1:9002/v2" if os.environ.get("SM_LOCAL_CLAUDE_TRANSCRIPTION") else None
+
+_DEBUG_LOG_PATH = Path("/tmp/crab-channel-debug.log")
+
+
+def dlog(tag: str, msg: str) -> None:
+    """Append a timestamped, tagged line to the shared channel debug log.
+
+    Gated on ``DEBUG=1`` env var so call sites pay nothing in production.
+    Tag should be one of ``voice`` / ``driver`` / ``server`` so log lines
+    group by source when grepping.
+    """
+    if not _DEBUG:
+        return
+    try:
+        with _DEBUG_LOG_PATH.open("a") as f:
+            f.write(f"{time.time():.3f}  {tag:6}  {msg}\n")
+    except OSError:
+        pass
+
 
 _DOT_INTERVAL = 0.2
 

@@ -17,9 +17,7 @@ from speechmatics.rt import AudioFormat
 from crab.asr.devices import list_input_devices
 from crab.asr.enrollment import _enroll_speaker_tui
 from crab.speaker_store import _load_speakers, _save_speakers
-from crab.tts.macos import _TTS_PROVIDER_MACOS, _TTS_PROVIDER_PYTHON
-from crab.ui.widgets import SettingsPanel  # noqa: F401  (kept for parity)
-
+from crab.tts import _TTS_PROVIDER_MACOS, _TTS_PROVIDER_PYTHON
 _DEVICE_DEFAULT = -1  # sentinel meaning "system default"
 _LEVEL_WIDTH = 24
 _LEVEL_SAMPLE_RATE = 16000
@@ -34,7 +32,7 @@ def _render_level(level: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Channel ask_menu modal (Phase 3d)
+# Channel ask_menu modal
 # ---------------------------------------------------------------------------
 
 class SelectMenuModal(ModalScreen[int]):

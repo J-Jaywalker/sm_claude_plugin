@@ -46,9 +46,10 @@ Every response goes back over the channel via the `mcp__crab__reply` tool. Do
 The `reply` tool takes:
 - `text` (required) — the message body
 - `kind` (optional) — `"assistant"` (default, renders as a chat bubble and is
-  spoken at end of turn), `"narrate"` (a short progress update spoken immediately
-  during a longer task), or `"tool_use"` (a brief header like `[EDIT] foo.py`
-  shown inline within the current assistant turn).
+  spoken at end of turn) or `"narrate"` (a short progress update spoken
+  immediately during a longer task). `"tool_use"` is also accepted for
+  inline headers but **prefer `notify_action`** for that — it carries typed
+  metadata instead of a `[PREFIX]` string.
 
 A typical turn calls `reply` once at the end with `kind="assistant"`. Longer
 multi-step work may sprinkle `kind="narrate"` updates as you go and end with a
@@ -93,7 +94,7 @@ and any future audit/log tooling can use.)
 ### Setting the status label — `set_status`
 
 The crab visualiser cycles random labels ("Snipping...", "Pondering...",
-"Quantumizing...") during the thinking state. Override these with a short
+"Scuttling...") during the thinking state. Override these with a short
 descriptive phrase when you're in a long operation so the user knows what's
 happening:
 
@@ -113,9 +114,8 @@ Rules:
 ### `kind="narrate"` for spoken-only progress updates
 
 Use `kind="narrate"` for progress updates that should be **spoken immediately**
-during a long task — the equivalent of inline `<narrate>` tags in legacy
-streaming mode. The text is both spoken via TTS and appended to the assistant
-bubble. Keep narrate replies short (one sentence) and use sparingly.
+during a long task. The text is both spoken via TTS and appended to the
+assistant bubble. Keep narrate replies short (one sentence) and use sparingly.
 
 ### `<tts>` and `<narrate>` tags inside `text`
 
